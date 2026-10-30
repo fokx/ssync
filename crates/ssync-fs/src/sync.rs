@@ -1,6 +1,7 @@
 //! Synchronization engine executing local filesystem transfers.
 
 use crate::FsError;
+use crate::filter::FilterSet;
 use crate::metadata::{FileMetadata, FileType};
 use crate::walker::TransferEntry;
 use ssync_core::checksum::{ChecksumAlgorithm, calculate_file_checksum};
@@ -12,6 +13,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Match type for alternate destination directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltDestMatch {
+    Link(usize),
+    Copy(usize),
+    Compare(usize),
+}
+
 /// Options for local synchronization execution.
 #[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
@@ -20,11 +29,25 @@ pub struct SyncOptions {
     pub quiet: bool,
     pub preserve_perms: bool,
     pub preserve_times: bool,
+    pub omit_dir_times: bool,
     pub preserve_owner: bool,
     pub preserve_group: bool,
     pub hard_links: bool,
     pub existing: bool,
+    pub ignore_existing: bool,
     pub delete: bool,
+    pub delete_before: bool,
+    pub delete_during: bool,
+    pub delete_delay: bool,
+    pub delete_after: bool,
+    pub delete_excluded: bool,
+    pub max_delete: Option<usize>,
+    pub remove_source_files: bool,
+    pub delay_updates: bool,
+    pub backup: bool,
+    pub backup_dir: Option<PathBuf>,
+    pub temp_dir: Option<PathBuf>,
+    pub suffix: String,
     pub itemize_changes: bool,
     pub checksum: bool,
     pub update: bool,
@@ -40,7 +63,12 @@ pub struct SyncOptions {
     pub whole_file: bool,
     pub stats: bool,
     pub debug: Option<String>,
+    pub info: Option<String>,
+    pub link_dest: Vec<PathBuf>,
+    pub copy_dest: Vec<PathBuf>,
+    pub compare_dest: Vec<PathBuf>,
     pub dest_is_file: bool,
+    pub filters: FilterSet,
 }
 
 pub struct SyncEngine {
@@ -86,9 +114,100 @@ impl SyncEngine {
         }
     }
 
+    fn find_alt_dest_match(
+        &self,
+        rel_path: &Path,
+        entry_meta: &FileMetadata,
+        dest_root: &Path,
+    ) -> Option<(AltDestMatch, PathBuf)> {
+        for (i, ldir) in self.options.link_dest.iter().enumerate() {
+            let full_dir = if ldir.is_absolute() {
+                ldir.clone()
+            } else {
+                crate::path::clean_path(&dest_root.join(ldir))
+            };
+            let cand = full_dir.join(rel_path);
+            if let Ok(meta) = FileMetadata::from_path(&cand, false) {
+                if meta.file_type == entry_meta.file_type {
+                    if meta.file_type == FileType::Directory {
+                        return Some((AltDestMatch::Link(i), cand));
+                    }
+                    if meta.size == entry_meta.size
+                        && Self::same_mtime(
+                            entry_meta.mtime_sec,
+                            entry_meta.mtime_nsec,
+                            meta.mtime_sec,
+                            meta.mtime_nsec,
+                            self.options.modify_window,
+                        )
+                    {
+                        return Some((AltDestMatch::Link(i), cand));
+                    }
+                }
+            }
+        }
+
+        for (i, cdir) in self.options.copy_dest.iter().enumerate() {
+            let full_dir = if cdir.is_absolute() {
+                cdir.clone()
+            } else {
+                crate::path::clean_path(&dest_root.join(cdir))
+            };
+            let cand = full_dir.join(rel_path);
+            if let Ok(meta) = FileMetadata::from_path(&cand, false) {
+                if meta.file_type == entry_meta.file_type {
+                    if meta.file_type == FileType::Directory {
+                        return Some((AltDestMatch::Copy(i), cand));
+                    }
+                    if meta.size == entry_meta.size
+                        && Self::same_mtime(
+                            entry_meta.mtime_sec,
+                            entry_meta.mtime_nsec,
+                            meta.mtime_sec,
+                            meta.mtime_nsec,
+                            self.options.modify_window,
+                        )
+                    {
+                        return Some((AltDestMatch::Copy(i), cand));
+                    }
+                }
+            }
+        }
+
+        for (i, cmp_dir) in self.options.compare_dest.iter().enumerate() {
+            let full_dir = if cmp_dir.is_absolute() {
+                cmp_dir.clone()
+            } else {
+                crate::path::clean_path(&dest_root.join(cmp_dir))
+            };
+            let cand = full_dir.join(rel_path);
+            if let Ok(meta) = FileMetadata::from_path(&cand, false) {
+                if meta.file_type == entry_meta.file_type {
+                    if meta.file_type == FileType::Directory {
+                        return Some((AltDestMatch::Compare(i), cand));
+                    }
+                    if meta.size == entry_meta.size
+                        && Self::same_mtime(
+                            entry_meta.mtime_sec,
+                            entry_meta.mtime_nsec,
+                            meta.mtime_sec,
+                            meta.mtime_nsec,
+                            self.options.modify_window,
+                        )
+                    {
+                        return Some((AltDestMatch::Compare(i), cand));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Executes the synchronization of entries into `dest_root`.
     pub fn execute(&self, entries: &[TransferEntry], dest_root: &Path) -> Result<(), FsError> {
-        if !self.options.dry_run && !dest_root.exists() {
+        let dest_existed = dest_root.exists();
+        if !self.options.dry_run && !dest_existed {
             if self.options.dest_is_file {
                 if let Some(parent) = dest_root.parent() {
                     fs::create_dir_all(parent)?;
@@ -98,9 +217,40 @@ impl SyncEngine {
             }
         }
 
-        let mut hardlink_map: HashMap<(u64, u64), PathBuf> = HashMap::new();
-        let mut dirs_to_update: Vec<(PathBuf, FileMetadata)> = Vec::new();
-        let mut transferred_paths: HashSet<PathBuf> = HashSet::new();
+        if !dest_existed
+            && !self.options.dest_is_file
+            && (self.options.verbose > 0 || self.options.itemize_changes)
+            && !self.options.quiet
+        {
+            println!("created directory {}", dest_root.display());
+        }
+
+        let transferred_paths: HashSet<PathBuf> = entries
+            .iter()
+            .map(|e| e.relative_dest_path.clone())
+            .collect();
+
+        let should_delete = self.options.delete
+            || self.options.delete_before
+            || self.options.delete_during
+            || self.options.delete_delay
+            || self.options.delete_after
+            || self.options.delete_excluded;
+
+        let delete_early = should_delete
+            && (self.options.delete_before
+                || self.options.delete_during
+                || (!self.options.delete_delay && !self.options.delete_after));
+
+        if delete_early {
+            self.perform_deletion(dest_root, &transferred_paths)?;
+        }
+
+        let mut hardlink_map: HashMap<(u64, u64), (PathBuf, PathBuf)> = HashMap::new();
+        let mut dirs_to_update: Vec<(PathBuf, PathBuf, FileMetadata, bool)> = Vec::new();
+        let mut delayed_updates: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut delayed_staging_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut transferred_names: Vec<String> = Vec::new();
         let mut total_stats = MatchStats::default();
 
         for entry in entries {
@@ -110,21 +260,34 @@ impl SyncEngine {
                 dest_root.join(&entry.relative_dest_path)
             };
 
-            transferred_paths.insert(entry.relative_dest_path.clone());
-
             if self.options.existing && !dest_path.exists() {
                 continue;
             }
 
             match entry.metadata.file_type {
                 FileType::Directory => {
-                    self.sync_directory(entry, &dest_path, &mut dirs_to_update)?;
+                    self.sync_directory(
+                        entry,
+                        &dest_path,
+                        dest_root,
+                        dest_existed,
+                        &mut dirs_to_update,
+                    )?;
                 }
                 FileType::Symlink => {
-                    self.sync_symlink(entry, &dest_path)?;
+                    self.sync_symlink(entry, &dest_path, dest_root)?;
                 }
                 FileType::Regular => {
-                    self.sync_regular_file(entry, &dest_path, &mut hardlink_map, &mut total_stats)?;
+                    self.sync_regular_file(
+                        entry,
+                        &dest_path,
+                        dest_root,
+                        &mut hardlink_map,
+                        &mut delayed_updates,
+                        &mut delayed_staging_dirs,
+                        &mut transferred_names,
+                        &mut total_stats,
+                    )?;
                 }
                 _ => {
                     self.sync_special(entry, &dest_path)?;
@@ -132,19 +295,36 @@ impl SyncEngine {
             }
         }
 
-        // Handle deletion of extraneous files if --delete is requested
-        if self.options.delete {
+        for name in transferred_names {
+            println!("{}", name);
+        }
+
+        let delete_late = should_delete && (self.options.delete_delay || self.options.delete_after);
+        if delete_late {
             self.perform_deletion(dest_root, &transferred_paths)?;
+        }
+
+        // Apply delayed updates if --delay-updates is active
+        if !delayed_updates.is_empty() && !self.options.dry_run {
+            for (staged_path, final_dest) in &delayed_updates {
+                if let Some(parent) = final_dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::rename(staged_path, final_dest)?;
+            }
+            for staging_dir in &delayed_staging_dirs {
+                let _ = fs::remove_dir(staging_dir);
+            }
         }
 
         // Apply metadata to directories in post-order (deepest directories first)
         dirs_to_update.sort_by_key(|a| std::cmp::Reverse(a.0.components().count()));
-        for (dir_path, meta) in dirs_to_update {
+        for (dir_path, _rel_path, meta, _newly_created) in dirs_to_update {
             if !self.options.dry_run {
                 meta.apply_to(
                     &dir_path,
                     self.options.preserve_perms,
-                    self.options.preserve_times,
+                    self.options.preserve_times && !self.options.omit_dir_times,
                     self.options.preserve_owner,
                     self.options.preserve_group,
                 )?;
@@ -176,64 +356,326 @@ impl SyncEngine {
         &self,
         entry: &TransferEntry,
         dest_path: &Path,
-        dirs_to_update: &mut Vec<(PathBuf, FileMetadata)>,
+        dest_root: &Path,
+        dest_existed: bool,
+        dirs_to_update: &mut Vec<(PathBuf, PathBuf, FileMetadata, bool)>,
     ) -> Result<(), FsError> {
+        let is_root = entry.relative_dest_path.as_os_str().is_empty();
+        let display_dir = if is_root {
+            "./".to_string()
+        } else {
+            format!("{}/", entry.relative_dest_path.display())
+        };
+
+        if let Some((_alt_match, _)) =
+            self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
+        {
+            if !self.options.dry_run && !dest_path.exists() {
+                fs::create_dir_all(dest_path)?;
+            }
+            if self.options.itemize_changes && !self.options.quiet {
+                if self.options.verbose > 1 {
+                    println!("cd          {}", display_dir);
+                }
+            } else if self.options.verbose > 1 && !self.options.quiet {
+                println!("{} is uptodate", display_dir);
+            }
+            dirs_to_update.push((
+                dest_path.to_path_buf(),
+                entry.relative_dest_path.clone(),
+                entry.metadata.clone(),
+                false,
+            ));
+            return Ok(());
+        }
+
+        let newly_created = if is_root {
+            !dest_existed
+        } else {
+            !dest_path.exists()
+        };
+
+        let existing_meta = if !newly_created {
+            FileMetadata::from_path(dest_path, false).ok()
+        } else {
+            None
+        };
+
         if !self.options.dry_run && !dest_path.exists() {
             fs::create_dir_all(dest_path)?;
         }
 
-        dirs_to_update.push((dest_path.to_path_buf(), entry.metadata.clone()));
+        if self.options.itemize_changes && !self.options.quiet {
+            if newly_created {
+                println!("cd+++++++++ {}", display_dir);
+            } else if let Some(ref emeta) = existing_meta {
+                let time_differs = self.options.preserve_times
+                    && !self.options.omit_dir_times
+                    && !Self::same_mtime(
+                        entry.metadata.mtime_sec,
+                        entry.metadata.mtime_nsec,
+                        emeta.mtime_sec,
+                        emeta.mtime_nsec,
+                        self.options.modify_window,
+                    );
+                if time_differs {
+                    let t_char = if self.options.preserve_times {
+                        't'
+                    } else {
+                        'T'
+                    };
+                    println!(".d..{}...... {}", t_char, display_dir);
+                } else if self.options.verbose > 1 {
+                    println!(".d          {}", display_dir);
+                }
+            } else if self.options.verbose > 1 {
+                println!(".d          {}", display_dir);
+            }
+        }
+
+        dirs_to_update.push((
+            dest_path.to_path_buf(),
+            entry.relative_dest_path.clone(),
+            entry.metadata.clone(),
+            newly_created,
+        ));
         Ok(())
     }
 
-    fn sync_symlink(&self, entry: &TransferEntry, dest_path: &Path) -> Result<(), FsError> {
+    fn sync_symlink(
+        &self,
+        entry: &TransferEntry,
+        dest_path: &Path,
+        dest_root: &Path,
+    ) -> Result<(), FsError> {
+        if self.options.ignore_existing && dest_path.symlink_metadata().is_ok() {
+            return Ok(());
+        }
+
         let target = entry
             .metadata
             .symlink_target
             .as_ref()
             .ok_or_else(|| FsError::MetadataError("Symlink target missing".to_string()))?;
 
-        if !self.options.dry_run {
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
+        if let Some((alt_type, _cand)) =
+            self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
+        {
+            let is_compare = matches!(alt_type, AltDestMatch::Compare(_));
+            let is_link = matches!(alt_type, AltDestMatch::Link(_));
+            let prefix = if is_compare {
+                ".L"
+            } else if is_link {
+                "hL"
+            } else {
+                "cL"
+            };
+
+            if !is_compare && !self.options.dry_run {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if dest_path.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(dest_path);
+                }
+                std::os::unix::fs::symlink(target, dest_path)?;
+                entry.metadata.apply_to(
+                    dest_path,
+                    self.options.preserve_perms,
+                    self.options.preserve_times,
+                    self.options.preserve_owner,
+                    self.options.preserve_group,
+                )?;
             }
 
-            if dest_path.symlink_metadata().is_ok() {
-                let _ = fs::remove_file(dest_path);
+            if self.options.itemize_changes && !self.options.quiet {
+                if self.options.verbose > 1 {
+                    println!(
+                        "{}          {} -> {}",
+                        prefix,
+                        entry.relative_dest_path.display(),
+                        target.display()
+                    );
+                }
+            } else if self.options.verbose > 1 && !self.options.quiet {
+                println!("{} is uptodate", entry.relative_dest_path.display());
             }
-
-            std::os::unix::fs::symlink(target, dest_path)?;
-            entry.metadata.apply_to(
-                dest_path,
-                self.options.preserve_perms,
-                self.options.preserve_times,
-                self.options.preserve_owner,
-                self.options.preserve_group,
-            )?;
+            return Ok(());
         }
 
-        if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet {
-            if self.options.itemize_changes {
-                println!("cL+++++++++ {}", entry.relative_dest_path.display());
-            } else if self.options.verbose > 1 {
+        let mut is_new = true;
+        let mut target_matches = false;
+
+        if let Ok(existing_target) = fs::read_link(dest_path) {
+            is_new = false;
+            if existing_target == *target {
+                target_matches = true;
+            }
+        }
+
+        if !target_matches {
+            if !self.options.dry_run {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                if dest_path.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(dest_path);
+                }
+
+                std::os::unix::fs::symlink(target, dest_path)?;
+                entry.metadata.apply_to(
+                    dest_path,
+                    self.options.preserve_perms,
+                    self.options.preserve_times,
+                    self.options.preserve_owner,
+                    self.options.preserve_group,
+                )?;
+            }
+
+            if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet {
+                if self.options.itemize_changes {
+                    if is_new {
+                        println!(
+                            "cL+++++++++ {} -> {}",
+                            entry.relative_dest_path.display(),
+                            target.display()
+                        );
+                    } else {
+                        let time_char = if self.options.preserve_times {
+                            't'
+                        } else {
+                            'T'
+                        };
+                        println!(
+                            "cLc.{}...... {} -> {}",
+                            time_char,
+                            entry.relative_dest_path.display(),
+                            target.display()
+                        );
+                    }
+                } else if self.options.verbose > 1 {
+                    println!(
+                        "{} -> {}",
+                        entry.relative_dest_path.display(),
+                        target.display()
+                    );
+                } else {
+                    println!("{}", entry.relative_dest_path.display());
+                }
+            }
+        } else {
+            // Target matches: unchanged symlink
+            if !self.options.dry_run {
+                entry.metadata.apply_to(
+                    dest_path,
+                    self.options.preserve_perms,
+                    self.options.preserve_times,
+                    self.options.preserve_owner,
+                    self.options.preserve_group,
+                )?;
+            }
+            if self.options.itemize_changes && self.options.verbose > 1 && !self.options.quiet {
                 println!(
-                    "{} -> {}",
+                    ".L          {} -> {}",
                     entry.relative_dest_path.display(),
                     target.display()
                 );
+            } else if self.options.verbose > 1 && !self.options.quiet {
+                println!("{} is uptodate", entry.relative_dest_path.display());
+            }
+        }
+
+        if self.options.remove_source_files && !self.options.dry_run {
+            let _ = fs::remove_file(&entry.source_path);
+        }
+
+        Ok(())
+    }
+
+    fn backup_file(
+        &self,
+        dest_path: &Path,
+        rel_path: &Path,
+        dest_root: &Path,
+        is_delete: bool,
+    ) -> Result<(), FsError> {
+        if !dest_path.exists() {
+            return Ok(());
+        }
+
+        let suffix = if self.options.suffix.is_empty() {
+            "~"
+        } else {
+            &self.options.suffix
+        };
+
+        let backup_dest = if let Some(ref bdir) = self.options.backup_dir {
+            let full_bdir = if bdir.is_absolute() {
+                bdir.clone()
             } else {
-                println!("{}", entry.relative_dest_path.display());
+                dest_root.join(bdir)
+            };
+            full_bdir.join(rel_path)
+        } else {
+            PathBuf::from(format!("{}{}", dest_path.display(), suffix))
+        };
+
+        if let Some(parent) = backup_dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        if backup_dest.exists() {
+            if backup_dest.is_dir() {
+                let _ = fs::remove_dir_all(&backup_dest);
+            } else {
+                let _ = fs::remove_file(&backup_dest);
+            }
+        }
+
+        let orig_meta = FileMetadata::from_path(dest_path, false).ok();
+
+        if is_delete {
+            fs::rename(dest_path, &backup_dest)?;
+        } else {
+            fs::copy(dest_path, &backup_dest)?;
+        }
+
+        if let Some(meta) = orig_meta {
+            let _ = meta.apply_to(&backup_dest, true, true, false, false);
+        }
+
+        let info_str = self.options.info.as_deref().unwrap_or("");
+        if info_str.contains("backup") || self.options.verbose > 0 {
+            if self.options.backup_dir.is_some() {
+                println!(
+                    "backed up {} to {}",
+                    rel_path.display(),
+                    backup_dest.display()
+                );
+            } else {
+                println!(
+                    "backed up {} to {}{}",
+                    rel_path.display(),
+                    rel_path.display(),
+                    suffix
+                );
             }
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sync_regular_file(
         &self,
         entry: &TransferEntry,
         dest_path: &Path,
-        hardlink_map: &mut HashMap<(u64, u64), PathBuf>,
+        dest_root: &Path,
+        hardlink_map: &mut HashMap<(u64, u64), (PathBuf, PathBuf)>,
+        delayed_updates: &mut Vec<(PathBuf, PathBuf)>,
+        delayed_staging_dirs: &mut HashSet<PathBuf>,
+        transferred_names: &mut Vec<String>,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         if !self.options.dry_run {
@@ -241,6 +683,16 @@ impl SyncEngine {
                 fs::create_dir_all(parent)?;
             }
         }
+
+        let display_path = if entry.relative_dest_path.as_os_str().is_empty() {
+            entry
+                .source_path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            entry.relative_dest_path.display().to_string()
+        };
 
         // Handle directory replacement when dest_path exists and is a directory
         if let Ok(meta) = fs::symlink_metadata(dest_path) {
@@ -261,29 +713,163 @@ impl SyncEngine {
             }
         }
 
+        // Check alternate destinations (--copy-dest, --link-dest, --compare-dest)
+        if let Some((alt_type, cand)) =
+            self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
+        {
+            let is_link = matches!(alt_type, AltDestMatch::Link(_));
+            let is_compare = matches!(alt_type, AltDestMatch::Compare(_));
+            let prefix = if is_link {
+                "hf"
+            } else if is_compare {
+                ".f"
+            } else {
+                "cf"
+            };
+
+            if self.options.hard_links && entry.metadata.nlink > 1 && !is_compare {
+                let key = (entry.metadata.dev, entry.metadata.ino);
+                if let Some((first_dest, first_rel)) = hardlink_map.get(&key) {
+                    if !is_compare && !self.options.dry_run {
+                        if dest_path.symlink_metadata().is_ok() {
+                            let _ = fs::remove_file(dest_path);
+                        }
+                        fs::hard_link(first_dest, dest_path)?;
+                    }
+                    if (self.options.verbose > 0 || self.options.itemize_changes)
+                        && !self.options.quiet
+                    {
+                        if self.options.itemize_changes {
+                            if !is_link || self.options.verbose > 1 {
+                                println!("hf          {} => {}", display_path, first_rel.display());
+                            }
+                        } else if self.options.verbose > 1 {
+                            if is_link {
+                                println!("{} is uptodate", display_path);
+                            } else {
+                                transferred_names.push(format!(
+                                    "{} => {}",
+                                    display_path,
+                                    first_rel.display()
+                                ));
+                            }
+                        } else {
+                            println!("{}", display_path);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            if !is_compare && !self.options.dry_run {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if dest_path.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(dest_path);
+                }
+                if is_link {
+                    fs::hard_link(&cand, dest_path)?;
+                } else {
+                    fs::copy(&cand, dest_path)?;
+                }
+                entry.metadata.apply_to(
+                    dest_path,
+                    self.options.preserve_perms,
+                    self.options.preserve_times,
+                    self.options.preserve_owner,
+                    self.options.preserve_group,
+                )?;
+            }
+
+            if self.options.hard_links && entry.metadata.nlink > 1 && !is_compare {
+                let key = (entry.metadata.dev, entry.metadata.ino);
+                hardlink_map.insert(
+                    key,
+                    (dest_path.to_path_buf(), entry.relative_dest_path.clone()),
+                );
+            }
+
+            if self.options.itemize_changes && !self.options.quiet {
+                if self.options.verbose > 1 {
+                    println!("{}          {}", prefix, display_path);
+                }
+            } else if self.options.verbose > 1 && !self.options.quiet {
+                println!("{} is uptodate", display_path);
+            }
+            return Ok(());
+        }
+
         // Hard link preservation: if -H is on and nlink > 1
         if self.options.hard_links && entry.metadata.nlink > 1 {
+            use std::os::unix::fs::MetadataExt;
             let key = (entry.metadata.dev, entry.metadata.ino);
-            if let Some(first_dest) = hardlink_map.get(&key) {
+            if let Some((first_dest, first_rel)) = hardlink_map.get(&key) {
+                let already_linked = if let (Ok(meta1), Ok(meta2)) =
+                    (fs::metadata(first_dest), fs::metadata(dest_path))
+                {
+                    meta1.dev() == meta2.dev() && meta1.ino() == meta2.ino()
+                } else {
+                    false
+                };
+
+                if already_linked {
+                    if self.options.itemize_changes && !self.options.quiet {
+                        if self.options.verbose > 1 {
+                            println!("hf          {}", display_path);
+                        }
+                    } else if self.options.verbose > 1 && !self.options.quiet {
+                        println!("{} is uptodate", display_path);
+                    }
+                    return Ok(());
+                }
+
                 if !self.options.dry_run {
                     if dest_path.symlink_metadata().is_ok() {
                         let _ = fs::remove_file(dest_path);
                     }
                     fs::hard_link(first_dest, dest_path)?;
+                    if self.options.remove_source_files {
+                        let _ = fs::remove_file(&entry.source_path);
+                    }
                 }
                 if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet
                 {
-                    println!("{}", entry.relative_dest_path.display());
+                    if self.options.itemize_changes {
+                        let time_char = if self.options.preserve_times {
+                            't'
+                        } else {
+                            'T'
+                        };
+                        println!(
+                            "hf..{}...... {} => {}",
+                            time_char,
+                            display_path,
+                            first_rel.display()
+                        );
+                    } else if self.options.verbose > 1 {
+                        transferred_names.push(format!(
+                            "{} => {}",
+                            display_path,
+                            first_rel.display()
+                        ));
+                    } else {
+                        println!("{}", display_path);
+                    }
                 }
                 return Ok(());
             }
         }
 
         let existing_dest_meta = FileMetadata::from_path(dest_path, false).ok();
+        if self.options.ignore_existing && existing_dest_meta.is_some() {
+            return Ok(());
+        }
         let mut needs_transfer = false;
         let mut itemize_char_content = '.';
         let mut itemize_char_size = '.';
         let mut itemize_char_time = '.';
+        let mut itemize_char_perms = '.';
 
         if let Some(ref dest_meta) = existing_dest_meta {
             if dest_meta.file_type != FileType::Regular {
@@ -298,11 +884,13 @@ impl SyncEngine {
                     self.options.modify_window,
                 )
             {
-                // Destination is newer, skip under -u
+                let info_str = self.options.info.as_deref().unwrap_or("");
+                if info_str.contains("skip") || self.options.verbose > 0 {
+                    println!("{} is newer", display_path);
+                }
                 return Ok(());
             } else if self.options.append || self.options.append_verify {
                 if dest_meta.size >= entry.metadata.size {
-                    // File is already equal or larger, append does not touch it
                     return Ok(());
                 }
                 needs_transfer = true;
@@ -328,7 +916,6 @@ impl SyncEngine {
                     }
                 }
             } else {
-                // Default quick check: size and mtime
                 let same_time = Self::same_mtime(
                     entry.metadata.mtime_sec,
                     entry.metadata.mtime_nsec,
@@ -342,44 +929,72 @@ impl SyncEngine {
                 }
                 if !same_time {
                     needs_transfer = true;
-                    itemize_char_time = 't';
+                    itemize_char_time = if self.options.preserve_times {
+                        't'
+                    } else {
+                        'T'
+                    };
                 }
             }
+
+            if self.options.preserve_perms
+                && (entry.metadata.mode & 0o7777) != (dest_meta.mode & 0o7777)
+            {
+                itemize_char_perms = 'p';
+            }
         } else {
-            // Destination does not exist
             needs_transfer = true;
         }
 
         if needs_transfer {
+            if existing_dest_meta.is_some() {
+                if self.options.checksum {
+                    itemize_char_content = 'c';
+                }
+                if self.options.preserve_times {
+                    itemize_char_time = 't';
+                } else {
+                    itemize_char_time = 'T';
+                }
+            }
+
             if !self.options.dry_run {
+                if self.options.backup && existing_dest_meta.is_some() {
+                    self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
+                }
+
                 if (self.options.append || self.options.append_verify)
                     && existing_dest_meta.is_some()
                 {
                     self.perform_append_transfer(entry, dest_path, total_stats)?;
                 } else if self.options.inplace {
                     self.perform_inplace_transfer(entry, dest_path, total_stats)?;
+                } else if self.options.delay_updates {
+                    self.perform_delay_updates_transfer(
+                        entry,
+                        dest_path,
+                        delayed_updates,
+                        delayed_staging_dirs,
+                        total_stats,
+                    )?;
                 } else {
                     self.perform_staged_transfer(entry, dest_path, total_stats)?;
                 }
 
-                entry.metadata.apply_to(
-                    dest_path,
-                    self.options.preserve_perms,
-                    self.options.preserve_times,
-                    self.options.preserve_owner,
-                    self.options.preserve_group,
-                )?;
-            }
+                if !self.options.delay_updates {
+                    entry.metadata.apply_to(
+                        dest_path,
+                        self.options.preserve_perms,
+                        self.options.preserve_times,
+                        self.options.preserve_owner,
+                        self.options.preserve_group,
+                    )?;
+                }
 
-            let display_path = if entry.relative_dest_path.as_os_str().is_empty() {
-                entry
-                    .source_path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            } else {
-                entry.relative_dest_path.display().to_string()
-            };
+                if self.options.remove_source_files {
+                    let _ = fs::remove_file(&entry.source_path);
+                }
+            }
 
             if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet {
                 if self.options.itemize_changes {
@@ -387,19 +1002,32 @@ impl SyncEngine {
                         println!(">f+++++++++ {}", display_path);
                     } else {
                         println!(
-                            ">f{}{}{}...... {}",
+                            ">f{}{}{}{}..... {}",
                             itemize_char_content,
                             itemize_char_size,
                             itemize_char_time,
+                            itemize_char_perms,
                             display_path
                         );
                     }
+                } else if self.options.verbose > 1 {
+                    transferred_names.push(display_path);
                 } else {
                     println!("{}", display_path);
                 }
             }
         } else if let Some(ref dest_meta) = existing_dest_meta {
-            // Content unchanged, but attributes may need retouching
+            let mode_differs = self.options.preserve_perms
+                && (entry.metadata.mode & 0o7777) != (dest_meta.mode & 0o7777);
+            let time_differs = self.options.preserve_times
+                && !Self::same_mtime(
+                    entry.metadata.mtime_sec,
+                    entry.metadata.mtime_nsec,
+                    dest_meta.mtime_sec,
+                    dest_meta.mtime_nsec,
+                    self.options.modify_window,
+                );
+
             if !self.options.dry_run {
                 entry.metadata.apply_to(
                     dest_path,
@@ -409,12 +1037,26 @@ impl SyncEngine {
                     self.options.preserve_group,
                 )?;
             }
-            let _ = dest_meta;
+
+            if self.options.itemize_changes && !self.options.quiet {
+                if mode_differs || time_differs {
+                    let t_char = if time_differs { 't' } else { '.' };
+                    let p_char = if mode_differs { 'p' } else { '.' };
+                    println!(".f..{}{}..... {}", t_char, p_char, display_path);
+                } else if self.options.verbose > 1 {
+                    println!(".f          {}", display_path);
+                }
+            } else if self.options.verbose > 1 && !self.options.quiet {
+                println!("{} is uptodate", display_path);
+            }
         }
 
         if self.options.hard_links && entry.metadata.nlink > 1 {
             let key = (entry.metadata.dev, entry.metadata.ino);
-            hardlink_map.insert(key, dest_path.to_path_buf());
+            hardlink_map.insert(
+                key,
+                (dest_path.to_path_buf(), entry.relative_dest_path.clone()),
+            );
         }
 
         Ok(())
@@ -449,7 +1091,6 @@ impl SyncEngine {
                 calculate_file_checksum(ChecksumAlgorithm::Md5, &entry.source_path, None)?;
             let dst_sum = calculate_file_checksum(ChecksumAlgorithm::Md5, dest_path, None)?;
             if src_sum != dst_sum {
-                // Prefix mismatch detected by --append-verify: rewrite entire file
                 let mut full_src = File::open(&entry.source_path)?;
                 let mut full_dst = OpenOptions::new()
                     .write(true)
@@ -520,12 +1161,16 @@ impl SyncEngine {
         dest_path: &Path,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
-        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
         let rand_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp_path = parent.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id));
+        let tmp_path = if let Some(ref tdir) = self.options.temp_dir {
+            tdir.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id))
+        } else {
+            let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+            parent.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id))
+        };
 
         let is_delta_mode = self.options.no_whole_file && dest_path.exists();
 
@@ -550,13 +1195,55 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
-            fs::write(&tmp_path, &reconstructed)?;
+            if let Err(e) = fs::write(&tmp_path, &reconstructed) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(FsError::Io(e));
+            }
         } else {
-            let copied = fs::copy(&entry.source_path, &tmp_path)?;
-            total_stats.literal_bytes += copied;
+            match fs::copy(&entry.source_path, &tmp_path) {
+                Ok(copied) => total_stats.literal_bytes += copied,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(FsError::Io(e));
+                }
+            }
         }
 
-        fs::rename(&tmp_path, dest_path)?;
+        if let Err(e) = fs::rename(&tmp_path, dest_path) {
+            if e.raw_os_error() == Some(libc::EXDEV)
+                || e.kind() == std::io::ErrorKind::CrossesDevices
+            {
+                let res = fs::copy(&tmp_path, dest_path);
+                let _ = fs::remove_file(&tmp_path);
+                res?;
+            } else {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(FsError::Io(e));
+            }
+        }
+        Ok(())
+    }
+
+    fn perform_delay_updates_transfer(
+        &self,
+        entry: &TransferEntry,
+        dest_path: &Path,
+        delayed_updates: &mut Vec<(PathBuf, PathBuf)>,
+        delayed_staging_dirs: &mut HashSet<PathBuf>,
+        total_stats: &mut MatchStats,
+    ) -> Result<(), FsError> {
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        let staging_dir = parent.join(".~tmp~");
+        let _ = fs::create_dir_all(&staging_dir);
+        delayed_staging_dirs.insert(staging_dir.clone());
+
+        let file_name = dest_path.file_name().unwrap();
+        let staged_file = staging_dir.join(file_name);
+
+        let copied = fs::copy(&entry.source_path, &staged_file)?;
+        total_stats.literal_bytes += copied;
+
+        delayed_updates.push((staged_file, dest_path.to_path_buf()));
         Ok(())
     }
 
@@ -593,22 +1280,70 @@ impl SyncEngine {
             return Ok(());
         }
 
+        let mut deletion_filters = self.options.filters.clone();
         let mut dest_entries = Vec::new();
-        self.collect_dest_entries(dest_root, Path::new(""), &mut dest_entries)?;
+        self.collect_dest_entries(
+            dest_root,
+            Path::new(""),
+            &mut deletion_filters,
+            &mut dest_entries,
+        )?;
 
         // Sort descending so child files/dirs are deleted before parent dirs
         dest_entries.sort_by_key(|a| std::cmp::Reverse(a.0.components().count()));
 
-        for (rel_path, is_dir) in dest_entries {
-            if !transferred_paths.contains(&rel_path) {
-                let full_path = dest_root.join(&rel_path);
+        let mut delete_count = 0;
+
+        for (rel_path, is_dir, entry_filters) in dest_entries {
+            if transferred_paths.contains(&rel_path) {
+                continue;
+            }
+
+            let rel_str = rel_path.to_string_lossy();
+
+            if entry_filters.is_protected_from_deletion(&rel_str, is_dir) {
+                continue;
+            }
+
+            if !entry_filters.is_included_on_receiver(&rel_str, is_dir)
+                && !self.options.delete_excluded
+            {
+                continue;
+            }
+
+            if let Some(max_del) = self.options.max_delete {
+                if delete_count >= max_del {
+                    return Err(FsError::DeleteLimitReached(max_del));
+                }
+            }
+
+            delete_count += 1;
+            let full_path = dest_root.join(&rel_path);
+
+            if self.options.itemize_changes && !self.options.quiet {
+                println!("*deleting   {}", rel_path.display());
+            } else if (self.options.verbose > 0
+                || self.options.delete
+                || self.options.delete_excluded)
+                && !self.options.quiet
+            {
                 println!("deleting {}", rel_path.display());
-                if !self.options.dry_run {
-                    if is_dir {
-                        let _ = fs::remove_dir(&full_path);
-                    } else {
-                        let _ = fs::remove_file(&full_path);
-                    }
+            }
+
+            if !self.options.dry_run {
+                let is_already_backup = self.options.backup_dir.is_none()
+                    && full_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.ends_with(&self.options.suffix))
+                        .unwrap_or(false);
+
+                if self.options.backup && !is_dir && !is_already_backup {
+                    self.backup_file(&full_path, &rel_path, dest_root, true)?;
+                } else if is_dir {
+                    let _ = fs::remove_dir(&full_path);
+                } else {
+                    let _ = fs::remove_file(&full_path);
                 }
             }
         }
@@ -620,18 +1355,26 @@ impl SyncEngine {
         &self,
         base: &Path,
         rel: &Path,
-        out: &mut Vec<(PathBuf, bool)>,
+        filters: &mut FilterSet,
+        out: &mut Vec<(PathBuf, bool, FilterSet)>,
     ) -> Result<(), FsError> {
         let dir = base.join(rel);
+        let mut dir_filters = filters.clone();
+        let new_rules =
+            dir_filters.load_dir_merge_rules(&dir, rel, crate::filter::RuleSide::Receiver);
+        if !new_rules.is_empty() {
+            dir_filters.prepend_rules(new_rules);
+        }
+
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
             let child_rel = rel.join(file_name);
             let meta = entry.file_type()?;
             let is_dir = meta.is_dir();
-            out.push((child_rel.clone(), is_dir));
+            out.push((child_rel.clone(), is_dir, dir_filters.clone()));
             if is_dir {
-                self.collect_dest_entries(base, &child_rel, out)?;
+                self.collect_dest_entries(base, &child_rel, &mut dir_filters, out)?;
             }
         }
         Ok(())
@@ -644,15 +1387,10 @@ mod tests {
 
     #[test]
     fn test_same_mtime_modify_window() {
-        // modify_window == 0: compares integer seconds only
         assert!(SyncEngine::same_mtime(100, 500, 100, 999, 0));
         assert!(!SyncEngine::same_mtime(100, 0, 101, 0, 0));
-
-        // modify_window < 0: exact nanoseconds
         assert!(SyncEngine::same_mtime(100, 500, 100, 500, -1));
         assert!(!SyncEngine::same_mtime(100, 500, 100, 501, -1));
-
-        // modify_window > 0: difference within window
         assert!(SyncEngine::same_mtime(100, 0, 102, 0, 2));
         assert!(SyncEngine::same_mtime(102, 0, 100, 0, 2));
         assert!(!SyncEngine::same_mtime(100, 0, 103, 0, 2));
@@ -664,8 +1402,6 @@ mod tests {
         assert!(!SyncEngine::is_newer(95, 0, 100, 0, 0));
         assert!(SyncEngine::is_newer(100, 200, 100, 100, 0));
         assert!(!SyncEngine::is_newer(100, 100, 100, 200, 0));
-
-        // With modify window
         assert!(!SyncEngine::is_newer(101, 0, 100, 0, 2));
         assert!(SyncEngine::is_newer(103, 0, 100, 0, 2));
     }

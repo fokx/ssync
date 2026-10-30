@@ -14,4 +14,6 @@ pub enum FsError {
     PathError(String),
     #[error("Metadata preservation error: {0}")]
     MetadataError(String),
+    #[error("Deletion limit exceeded: {0}")]
+    DeleteLimitReached(usize),
 }

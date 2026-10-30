@@ -24,6 +24,7 @@ pub struct WalkOptions {
     pub dest_is_file: bool,
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
+    pub prune_empty_dirs: bool,
 }
 
 /// Represents an item scheduled for transfer.
@@ -53,6 +54,27 @@ impl Walker {
             self.scan_single_source(source, &mut entries, &mut seen_dest_paths)?;
         }
 
+        if self.options.prune_empty_dirs {
+            // Collect set of all relative paths for non-directory items
+            let non_dirs: Vec<PathBuf> = entries
+                .iter()
+                .filter(|e| e.metadata.file_type != FileType::Directory)
+                .map(|e| e.relative_dest_path.clone())
+                .collect();
+
+            entries.retain(|e| {
+                if e.metadata.file_type != FileType::Directory {
+                    return true;
+                }
+                if e.relative_dest_path.as_os_str().is_empty() {
+                    return true; // Keep transfer root
+                }
+                non_dirs
+                    .iter()
+                    .any(|nd| nd.starts_with(&e.relative_dest_path))
+            });
+        }
+
         Ok(entries)
     }
 
@@ -62,6 +84,8 @@ impl Walker {
         entries: &mut Vec<TransferEntry>,
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
+        let mut filters = self.options.filters.clone();
+
         if self.options.relative {
             // Check if there is an explicit anchor (starts with "./" or contains "/./")
             if let Some(anc) = source.anchor_path() {
@@ -132,7 +156,13 @@ impl Walker {
 
             // 2. Scan the source item itself under its relative cut path
             let rel_base = source.relative_cut_path();
-            self.scan_path(&source.path, &rel_base, entries, seen_dest_paths)?;
+            self.scan_path(
+                &source.path,
+                &rel_base,
+                &mut filters,
+                entries,
+                seen_dest_paths,
+            )?;
         } else {
             // Non-relative traversal
             let meta = self.read_meta(&source.path)?;
@@ -148,7 +178,13 @@ impl Walker {
                             is_implied_dir: false,
                         });
                     }
-                    self.scan_dir_contents(&source.path, Path::new(""), entries, seen_dest_paths)?;
+                    self.scan_dir_contents(
+                        &source.path,
+                        Path::new(""),
+                        &filters,
+                        entries,
+                        seen_dest_paths,
+                    )?;
                 } else {
                     // The directory itself is transferred as a subfolder
                     let dir_name = source
@@ -156,7 +192,13 @@ impl Walker {
                         .file_name()
                         .ok_or_else(|| FsError::PathError("Invalid directory name".to_string()))?;
                     let rel_dest = PathBuf::from(dir_name);
-                    self.scan_path(&source.path, &rel_dest, entries, seen_dest_paths)?;
+                    self.scan_path(
+                        &source.path,
+                        &rel_dest,
+                        &mut filters,
+                        entries,
+                        seen_dest_paths,
+                    )?;
                 }
             } else {
                 // Single file/symlink transfer
@@ -169,7 +211,13 @@ impl Walker {
                         .ok_or_else(|| FsError::PathError("Invalid file name".to_string()))?;
                     PathBuf::from(file_name)
                 };
-                self.scan_path(&source.path, &rel_dest, entries, seen_dest_paths)?;
+                self.scan_path(
+                    &source.path,
+                    &rel_dest,
+                    &mut filters,
+                    entries,
+                    seen_dest_paths,
+                )?;
             }
         }
 
@@ -226,6 +274,7 @@ impl Walker {
         &self,
         src: &Path,
         rel_dest: &Path,
+        current_filters: &mut FilterSet,
         entries: &mut Vec<TransferEntry>,
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
@@ -255,7 +304,7 @@ impl Walker {
 
         // Filter evaluation
         let rel_str = rel_dest.to_string_lossy();
-        if !self.options.filters.is_included(&rel_str, is_dir) {
+        if !current_filters.is_included(&rel_str, is_dir) {
             return Ok(());
         }
 
@@ -294,7 +343,7 @@ impl Walker {
             }
 
             if self.options.recursive {
-                self.scan_dir_contents(src, rel_dest, entries, seen_dest_paths)?;
+                self.scan_dir_contents(src, rel_dest, current_filters, entries, seen_dest_paths)?;
             }
         } else if seen_dest_paths.insert(rel_dest.to_path_buf()) {
             entries.push(TransferEntry {
@@ -312,9 +361,17 @@ impl Walker {
         &self,
         dir_path: &Path,
         rel_prefix: &Path,
+        parent_filters: &FilterSet,
         entries: &mut Vec<TransferEntry>,
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
+        let mut dir_filters = parent_filters.clone();
+        let new_rules =
+            dir_filters.load_dir_merge_rules(dir_path, rel_prefix, crate::filter::RuleSide::Sender);
+        if !new_rules.is_empty() {
+            dir_filters.prepend_rules(new_rules);
+        }
+
         let mut read_entries = Vec::new();
         for entry in fs::read_dir(dir_path)? {
             read_entries.push(entry?.path());
@@ -325,7 +382,13 @@ impl Walker {
         for child_path in read_entries {
             let child_name = child_path.file_name().unwrap();
             let child_rel_dest = rel_prefix.join(child_name);
-            self.scan_path(&child_path, &child_rel_dest, entries, seen_dest_paths)?;
+            self.scan_path(
+                &child_path,
+                &child_rel_dest,
+                &mut dir_filters,
+                entries,
+                seen_dest_paths,
+            )?;
         }
 
         Ok(())

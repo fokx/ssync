@@ -241,13 +241,25 @@ Rsync operates across three primary processes, configured depending on the trans
 ### Pattern Matching Grammar (`lib/wildmatch.c`)
 - First-matching rule determines outcome. If no rule matches, file is included.
 - `*`: Matches any character except path separator `/`.
-- `**`: Matches any character including `/`.
-- `***`: In include/exclude patterns, matches file and causes recursive inclusion of whole subtree.
+- `**`: Matches any character including `/`. Any pattern containing `**` (or `/`) matches against the full relative path from the filter scope rather than the leaf basename.
+- `**/`: Matches zero or more directory levels (e.g., `**/bar` matches `bar` at the transfer root as well as `foo/bar`).
+- `***`: In include/exclude patterns, matches file/directory and causes recursive inclusion/exclusion of the whole subtree.
 - Anchoring:
   - Pattern with leading `/`: Anchored to the root of the transfer.
   - Pattern with `/` anywhere in middle: Anchored relative to the directory containing the filter rule.
   - Pattern without `/`: Matches the basename of the file at any depth.
 - Trailing `/`: Matches directories only.
+
+### Filter Modifiers and Merge Rules (`exclude.c`)
+- **Rule Modifiers**:
+  - `s` / `r`: Sender-only (`RuleSide::Sender`) vs Receiver-only (`RuleSide::Receiver`). `H` (hide) and sender rules prune the sender's file-list, but do not protect files from deletion on receiver. `P` (protect) protects files from deletion on receiver.
+  - `n`: No-inherit (rule does not apply to child subdirectories).
+  - `-` / `+`: `FILTRULE_NO_PREFIXES`: lines in the merge file omit `+`/`-` prefixes and default to exclude/include.
+  - `C`: CVS ignore merge rule (`FILTRULE_NO_PREFIXES | FILTRULE_WORD_SPLIT | FILTRULE_NO_INHERIT | FILTRULE_CVS_IGNORE`). Merges `.cvsignore` rules for that directory only, never subdirectories.
+  - `!`: Clears existing filter rules in the current merge file scope.
+- **Merge File Processing**:
+  - Rules loaded from dir-merge files are prepended to the parent rule set so that more deeply nested local rules take precedence over inherited ancestor rules.
+  - Dir-merge rules are loaded during both sender tree traversal and receiver deletion traversal to correctly protect or delete files.
 
 ---
 

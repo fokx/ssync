@@ -40,9 +40,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/run_upstream_tests.sh hands dirs links relative
 ```
 
-## Supported Flags (Phase 1 & Phase 2)
+## Supported Flags (Phase 1, Phase 2 & Phase 3)
 
-`ssync` currently supports local recursive file transfer, metadata synchronization, and delta transfers:
+`ssync` currently supports local recursive file transfer, metadata synchronization, delta transfers, and advanced filtering/staging:
 - `-a, --archive`: Archive mode (equivalent to `-rlptgoD`).
 - `-r, --recursive`: Recurse into directories.
 - `-l, --links`: Copy symlinks as symlinks.
@@ -50,6 +50,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 - `-k, --copy-dirlinks`: Treat symlinked directories as directories.
 - `-p, --perms`: Preserve permissions / mode.
 - `-t, --times`: Preserve modification times (nanosecond precision).
+- `-O, --omit-dir-times`: Omit directories when setting modification times.
 - `-o, --owner`, `-g, --group`: Preserve owner and group (best effort).
 - `-d, --dirs`: Transfer directories without recursing into them.
 - `-R, --relative`: Relative path replication with `./` cut point support.
@@ -68,6 +69,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 - `--stats`: Output transfer statistics (literal data, matched data).
 - `-H, --hard-links`: Preserve hard link relationships.
 - `--delete, --del`: Delete extraneous destination files.
+- `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`: Precise deletion timing.
+- `--delete-excluded`: Delete excluded files from destination.
+- `--max-delete=NUM`: Limit the maximum number of deleted files.
+- `--existing`: Only update files that already exist on destination.
+- `--ignore-existing`: Skip updating files that already exist on destination.
+- `-m, --prune-empty-dirs`: Prune empty directory chains from file-list.
+- `-f, --filter=RULE`: Rule-based filtering (`+`, `-`, `P`, `R`, `H`, `S`, `!`, `.`, `:`, `dir-merge`).
+- `--exclude=PATTERN`, `--include=PATTERN`: Include/exclude pattern filters.
+- `--exclude-from=FILE`, `--include-from=FILE`: Load rules from files.
+- `-C, --cvs-exclude`: CVS exclusion rules and per-directory `.cvsignore` merge.
+- `-F`: Shorthand for `:C` (dir-merge `.cvsignore`) / `-C`.
+- `-b, --backup`: Make backups of updated or deleted files.
+- `--backup-dir=DIR`: Relocate backups to designated directory hierarchy.
+- `--suffix=SUFFIX`: Backup filename suffix (default `~`).
+- `--delay-updates`: Stage updated files until the transfer pass is finished.
+- `-T, --temp-dir=DIR`: Use temporary directory for staging during transfer.
+- `--remove-source-files`: Remove source files after successful transfer.
+- `--link-dest=DIR`, `--copy-dest=DIR`, `--compare-dest=DIR`: Alternate destination basis trees.
 - `--safe-links`, `--copy-unsafe-links`: Path-escape link handling.
-- `-i, --itemize-changes`: 11-character itemized change summary.
+- `-i, --itemize-changes`: 11-character itemized change summary (`-ii` for unchanged items).
 - `-v, --verbose`, `-q, --quiet`, `-n, --dry-run`.

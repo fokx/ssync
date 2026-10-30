@@ -1,11 +1,12 @@
 //! ssync: Clean-room, high-performance file synchronization tool in Rust.
 
 use clap::Parser;
-use ssync_fs::filter::FilterSet;
+use ssync_fs::FsError;
+use ssync_fs::filter::{FilterSet, RuleAction};
 use ssync_fs::path::SourcePath;
 use ssync_fs::sync::{SyncEngine, SyncOptions};
 use ssync_fs::walker::{WalkOptions, Walker};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Parser, Debug, Clone)]
@@ -55,6 +56,10 @@ struct Cli {
     /// Preserve modification times
     #[arg(short = 't', long = "times")]
     times: bool,
+
+    /// Omit directories from --times
+    #[arg(short = 'O', long = "omit-dir-times")]
+    omit_dir_times: bool,
 
     /// Preserve owner (super-user only)
     #[arg(short = 'o', long = "owner")]
@@ -164,21 +169,113 @@ struct Cli {
     #[arg(long = "delete", alias = "del")]
     delete: bool,
 
+    /// Receiver deletes before transfer, not during
+    #[arg(long = "delete-before")]
+    delete_before: bool,
+
+    /// Receiver deletes during transfer (default)
+    #[arg(long = "delete-during")]
+    delete_during: bool,
+
+    /// Find deletions during, delete after
+    #[arg(long = "delete-delay")]
+    delete_delay: bool,
+
+    /// Receiver deletes after transfer, not during
+    #[arg(long = "delete-after")]
+    delete_after: bool,
+
+    /// Also delete excluded files from dest dirs
+    #[arg(long = "delete-excluded")]
+    delete_excluded: bool,
+
+    /// Don't delete more than NUM files
+    #[arg(long = "max-delete")]
+    max_delete: Option<usize>,
+
+    /// Delete files on sender after successfully transferring them
+    #[arg(long = "remove-source-files")]
+    remove_source_files: bool,
+
+    /// Keep partially transferred files
+    #[arg(long = "partial")]
+    partial: bool,
+
+    /// Put a partially transferred file into DIR
+    #[arg(long = "partial-dir")]
+    partial_dir: Option<String>,
+
+    /// Put all updated files into place at end
+    #[arg(long = "delay-updates")]
+    delay_updates: bool,
+
+    /// Make backups (see --suffix & --backup-dir)
+    #[arg(short = 'b', long = "backup")]
+    backup: bool,
+
+    /// Make backups into hierarchy based in DIR
+    #[arg(long = "backup-dir")]
+    backup_dir: Option<String>,
+
+    /// Backup suffix (default ~ w/o --backup-dir)
+    #[arg(long = "suffix")]
+    suffix: Option<String>,
+
+    /// Use temporary directory for staging
+    #[arg(short = 'T', long = "temp-dir")]
+    temp_dir: Option<String>,
+
+    /// Prune empty directory chains from file-list
+    #[arg(short = 'm', long = "prune-empty-dirs")]
+    prune_empty_dirs: bool,
+
+    /// Add a filter rule
+    #[arg(short = 'f', long = "filter", action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    filter: Vec<String>,
+
+    /// Auto-ignore files the same way CVS does
+    #[arg(short = 'C', long = "cvs-exclude")]
+    cvs_exclude: bool,
+
+    /// Shorthand for :C (dir-merge .cvsignore) / -C
+    #[arg(short = 'F', action = clap::ArgAction::Count)]
+    filter_cvs: u8,
+
+    /// Read exclude patterns from FILE
+    #[arg(long = "exclude-from", action = clap::ArgAction::Append)]
+    exclude_from: Vec<String>,
+
+    /// Read include patterns from FILE
+    #[arg(long = "include-from", action = clap::ArgAction::Append)]
+    include_from: Vec<String>,
+
+    /// Exclude files matching PATTERN
+    #[arg(long = "exclude", action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    exclude: Vec<String>,
+
+    /// Don't exclude files matching PATTERN
+    #[arg(long = "include", action = clap::ArgAction::Append, allow_hyphen_values = true)]
+    include: Vec<String>,
+
+    /// Specify the remote shell to use
+    #[arg(short = 'e', long = "rsh")]
+    rsh: Option<String>,
+
     /// Only update files that already exist on destination
     #[arg(long = "existing")]
     existing: bool,
 
+    /// Skip updating files that already exist on destination
+    #[arg(long = "ignore-existing")]
+    ignore_existing: bool,
+
     /// Output a change-summary for all updates
-    #[arg(short = 'i', long = "itemize-changes")]
-    itemize_changes: bool,
+    #[arg(short = 'i', long = "itemize-changes", action = clap::ArgAction::Count)]
+    itemize_changes: u8,
 
-    /// Exclude files matching PATTERN
-    #[arg(long = "exclude", action = clap::ArgAction::Append)]
-    exclude: Vec<String>,
-
-    /// Don't exclude files matching PATTERN
-    #[arg(long = "include", action = clap::ArgAction::Append)]
-    include: Vec<String>,
+    /// Output format
+    #[arg(long = "out-format")]
+    out_format: Option<String>,
 
     /// Bandwidth limit (compatibility placeholder)
     #[arg(long = "bwlimit")]
@@ -187,6 +284,30 @@ struct Cli {
     /// Debug options
     #[arg(long = "debug")]
     debug: Option<String>,
+
+    /// Fine-grained informational output
+    #[arg(long = "info")]
+    info: Option<String>,
+
+    /// Specify the rsync path to run on remote machine
+    #[arg(long = "rsync-path")]
+    rsync_path: Option<String>,
+
+    /// Affect file and/or directory permissions
+    #[arg(long = "chmod")]
+    chmod: Option<String>,
+
+    /// Hardlink to files in DIR when unchanged
+    #[arg(long = "link-dest", action = clap::ArgAction::Append)]
+    link_dest: Vec<String>,
+
+    /// Copy files from DIR when unchanged
+    #[arg(long = "copy-dest", action = clap::ArgAction::Append)]
+    copy_dest: Vec<String>,
+
+    /// Compare destination files to DIR
+    #[arg(long = "compare-dest", action = clap::ArgAction::Append)]
+    compare_dest: Vec<String>,
 
     /// Disable whole-file updates
     #[arg(long = "no-whole-file")]
@@ -239,8 +360,9 @@ fn main() {
     }
 
     if cli.version_caps >= 2 {
-        // Output JSON capabilities when -VV is requested (used by rsyncfns in tests)
-        println!(r#"{{"ACLs": false, "xattrs": false, "sha256": true, "sha512": true}}"#);
+        println!(
+            r#"{{"ACLs": false, "xattrs": false, "sha256": true, "sha512": true, "hardlink_symlinks": true, "symtimes": true}}"#
+        );
         return;
     } else if cli.version_caps == 1 {
         println!("ssync version 0.1.0  protocol version 31");
@@ -274,9 +396,53 @@ fn main() {
 
     // Set up filter rules
     let mut filters = FilterSet::new();
+
+    if cli.filter_cvs >= 2 {
+        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
+        filters.add_cvs_excludes();
+    } else if cli.filter_cvs == 1 {
+        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
+    }
+
+    if cli.cvs_exclude {
+        filters.add_cvs_excludes();
+    }
+
+    for arg in &cli.filter {
+        if let Err(e) = filters.add_filter_arg(arg) {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        }
+    }
+
+    for inc_file in &cli.include_from {
+        if inc_file == "-" {
+            if let Err(e) = filters.load_stdin(RuleAction::Include) {
+                eprintln!("ssync: failed reading include from stdin: {}", e);
+                process::exit(1);
+            }
+        } else if let Err(e) = filters.load_file(Path::new(inc_file), RuleAction::Include) {
+            eprintln!("ssync: failed opening include file: {}", e);
+            process::exit(1);
+        }
+    }
+
     for inc in &cli.include {
         filters.add_include(inc);
     }
+
+    for exc_file in &cli.exclude_from {
+        if exc_file == "-" {
+            if let Err(e) = filters.load_stdin(RuleAction::Exclude) {
+                eprintln!("ssync: failed reading exclude from stdin: {}", e);
+                process::exit(1);
+            }
+        } else if let Err(e) = filters.load_file(Path::new(exc_file), RuleAction::Exclude) {
+            eprintln!("ssync: failed opening exclude file: {}", e);
+            process::exit(1);
+        }
+    }
+
     for exc in &cli.exclude {
         filters.add_exclude(exc);
     }
@@ -316,10 +482,11 @@ fn main() {
         safe_links: cli.safe_links,
         relative: cli.relative,
         no_implied_dirs: cli.no_implied_dirs,
-        filters,
+        filters: filters.clone(),
         dest_is_file,
         max_size,
         min_size,
+        prune_empty_dirs: cli.prune_empty_dirs,
     };
 
     let walker = Walker::new(walk_opts);
@@ -331,18 +498,54 @@ fn main() {
         }
     };
 
+    if let Some(ref tdir) = cli.temp_dir {
+        let p = Path::new(tdir);
+        if !p.is_dir() {
+            eprintln!("The temp-dir does not exist: {}", tdir);
+            process::exit(1);
+        }
+    }
+
+    let backup_dir = cli.backup_dir.map(PathBuf::from);
+    let temp_dir = cli.temp_dir.map(PathBuf::from);
+    let suffix = cli.suffix.unwrap_or_else(|| "~".to_string());
+    let itemize_changes = cli.itemize_changes > 0;
+    let verbose = if cli.itemize_changes > 1 && cli.verbose < 2 {
+        2
+    } else {
+        cli.verbose
+    };
+
+    let link_dest: Vec<PathBuf> = cli.link_dest.into_iter().map(PathBuf::from).collect();
+    let copy_dest: Vec<PathBuf> = cli.copy_dest.into_iter().map(PathBuf::from).collect();
+    let compare_dest: Vec<PathBuf> = cli.compare_dest.into_iter().map(PathBuf::from).collect();
+
     let sync_opts = SyncOptions {
         dry_run: cli.dry_run,
-        verbose: cli.verbose,
+        verbose,
         quiet: cli.quiet,
         preserve_perms: perms,
         preserve_times: times,
+        omit_dir_times: cli.omit_dir_times,
         preserve_owner: owner,
         preserve_group: group,
         hard_links: cli.hard_links,
         existing: cli.existing,
+        ignore_existing: cli.ignore_existing,
         delete: cli.delete,
-        itemize_changes: cli.itemize_changes,
+        delete_before: cli.delete_before,
+        delete_during: cli.delete_during,
+        delete_delay: cli.delete_delay,
+        delete_after: cli.delete_after,
+        delete_excluded: cli.delete_excluded,
+        max_delete: cli.max_delete,
+        remove_source_files: cli.remove_source_files,
+        delay_updates: cli.delay_updates,
+        backup: cli.backup,
+        backup_dir,
+        temp_dir,
+        suffix,
+        itemize_changes,
         checksum: cli.checksum,
         update: cli.update,
         ignore_times: cli.ignore_times,
@@ -357,12 +560,25 @@ fn main() {
         whole_file: cli.whole_file,
         stats: cli.stats,
         debug: cli.debug,
+        info: cli.info,
+        link_dest,
+        copy_dest,
+        compare_dest,
         dest_is_file,
+        filters,
     };
 
     let engine = SyncEngine::new(sync_opts);
     if let Err(e) = engine.execute(&entries, &dest_path) {
-        eprintln!("ssync: transfer error: {}", e);
-        process::exit(11);
+        match e {
+            FsError::DeleteLimitReached(_) => {
+                eprintln!("ssync: {}", e);
+                process::exit(25);
+            }
+            _ => {
+                eprintln!("ssync: transfer error: {}", e);
+                process::exit(11);
+            }
+        }
     }
 }

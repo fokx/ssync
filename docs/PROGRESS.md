@@ -28,13 +28,13 @@ This document tracks implementation status across phases, records upstream test 
   - [x] Implement delta token generator and full reconstructor with property-based proptest roundtrip verification.
   - [x] Integrate quick-check comparison (`-c, --checksum`, `-u, --update`, `-I, --ignore-times`, `--size-only`, `--modify-window`), `--max-size`, `--min-size`, and staging modes (`--inplace`, `--append`, `--append-verify`, temporary file staging).
   - [x] Pass target upstream tests: `compare`, `update`, `append`, `inplace`, `hashsearch-chain`, `hashsearch-collision-skip`, `hashsearch-dup-chain`, `size-filter`.
-- [ ] **Phase 3: Filters, Deletion & Advanced Local Synchronization**
-  - [ ] Implement filter rule parser and wildmatch engine.
-  - [ ] Implement deletion logic (`--delete`, `--delete-before/during/delay/after`).
-  - [ ] Implement staging modes (`--delay-updates`, `--partial`, `-b/--backup`).
-  - [ ] Implement hardlink preservation (`-H`).
-  - [ ] Implement itemize changes (`-i`) and stats (`--stats`).
-  - [ ] Pass target upstream tests: `exclude`, `delete`, `delay-updates`, `backup`, `hardlinks`, `itemize`.
+- [x] **Phase 3: Filters, Deletion & Advanced Local Synchronization**
+  - [x] Implement filter rule parser and wildmatch engine (`*`, `**`, `***`, `/`, character classes, negate, prefix modifiers, dir-merge, `.cvsignore`).
+  - [x] Implement deletion logic (`--delete`, `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`, `--delete-excluded`, `--max-delete`).
+  - [x] Implement staging modes (`--delay-updates`, `-b/--backup`, `--backup-dir`, `--suffix`, `-T/--temp-dir`, `--existing`, `--ignore-existing`, `--omit-dir-times`).
+  - [x] Implement hardlink preservation (`-H, --hard-links`) and alternate basis trees (`--link-dest`, `--copy-dest`, `--compare-dest`).
+  - [x] Implement itemize changes (`-i, -ii, --itemize-changes`) with exact 11-character formatting, and `--stats`.
+  - [x] Pass target upstream tests: `exclude`, `cvs-exclude`, `delete`, `delete-deep`, `delay-updates`, `backup`, `backup-deep`, `backup-dir-relative`, `hardlinks-deep`, `itemize`, `alt-dest-deep`, `temp-dir`.
 - [ ] **Phase 4: Remote Shell Execution & Wire Protocol 31**
   - [ ] Implement multiplexed framing (`MPLEX_BASE`) and varint encoding in `ssync-proto`.
   - [ ] Implement flist wire serialization.
@@ -75,11 +75,18 @@ This document tracks implementation status across phases, records upstream test 
 | `hashsearch-collision-skip` | Required | **Passed** | Phase 2 | Collision flood skip boundary preservation and statistics |
 | `hashsearch-dup-chain` | Required | **Passed** | Phase 2 | Duplicate colliding chain unlinking (issue #1115) |
 | `size-filter` | Required | **Passed** | Phase 2 | Size threshold filtering (`--max-size`, `--min-size`) |
-| `merge` | Required | Pending | Phase 3 | Multi-source merge into single target |
-| `exclude` | Required | Pending | Phase 3 | Exclude and filter rule evaluation |
-| `delete` | Required | Pending | Phase 3 | Deletion modes |
-| `hardlinks` | Required | Pending | Phase 3 | Hardlink detection and creation (`-H`) |
-| `itemize` | Required | Pending | Phase 3 | Itemized changes output (`-i`) |
+| `exclude` | Required | **Passed** | Phase 3 | Exclude and filter rule evaluation |
+| `cvs-exclude` | Required | **Passed** | Phase 3 | CVS ignore defaults, env vars, and deep `.cvsignore` scoping |
+| `delete` | Required | **Passed** | Phase 3 | Deletion modes (`--delete-before/during/delay/after`) |
+| `delete-deep` | Required | **Passed** | Phase 3 | Deletion at depth, `--max-delete`, `--existing`, `--ignore-existing` |
+| `delay-updates` | Required | **Passed** | Phase 3 | Staging updates in `.~tmp~` and final atomic rename |
+| `backup` | Required | **Passed** | Phase 3 | File backup semantics with suffix and backup dir |
+| `backup-deep` | Required | **Passed** | Phase 3 | Recursive backup directory preservation |
+| `backup-dir-relative` | Required | **Passed** | Phase 3 | Relative backup directory resolution |
+| `hardlinks-deep` | Required | **Passed** | Phase 3 | Local hard link preservation across directory boundaries |
+| `itemize` | Required | **Passed** | Phase 3 | Itemized changes output (`-i`, `-ii`) and verbose formatting |
+| `alt-dest-deep` | Required | **Passed** | Phase 3 | `--link-dest`, `--copy-dest`, `--compare-dest` at depth |
+| `temp-dir` | Required | **Passed** | Phase 3 | Cross-directory staging and missing temp dir failure |
 | `00-hello` | Deferred | Pending | Phase 4 | Remote server smoke test |
 
 *(Full mapping of all 374 upstream tests is maintained in `docs/TESTSUITE_MAP.md`)*
@@ -95,16 +102,19 @@ This document tracks implementation status across phases, records upstream test 
 
 ---
 
-## 4. Notes for Next Session (Phase 3: Filters, Deletion & Advanced Local Synchronization)
+## 4. Notes for Next Session (Phase 4: Remote Shell Execution & Wire Protocol 31)
 
-1. **Immediate Focus**: Implement Phase 3: Filters, Deletion & Advanced Local Synchronization.
+1. **Immediate Focus**: Implement Phase 4: Remote Shell Execution & Wire Protocol 31.
 2. **Key Components to Implement**:
-   - `crates/ssync-fs`:
-     - Full filter and wildmatch parser matching rsync pattern rules (`+`, `-`, `!`, `:`, `.`, `dir-merge`, CVS exclude `-C`).
-     - Deletion engine: `--delete`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--max-delete`.
-     - Advanced staging & atomic update modes: `--delay-updates` (staging in `.~tmp~` folders), `--partial`, `--partial-dir`, `-b, --backup`, `--backup-dir`, `--suffix`.
-     - Hardlink preservation (`-H, --hard-links`) tracking and link creation.
-     - Full 11-character itemize changes output format (`-i, --itemize-changes`) and transfer stats (`--stats`).
+   - `crates/ssync-proto`:
+     - Protocol 31 wire handshake and compatibility bitflags (`CF_INC_RECURSE`, `CF_SYMLINK_TIMES`, `CF_SAFE_FLIST`, `CF_VARINT_FLIST_FLAGS`).
+     - Multiplexed channel framing (`MPLEX_BASE = 7`, `MSG_DATA`, `MSG_INFO`, `MSG_ERROR_XFER`, etc.).
+     - Variable-length integer encoding and decoding (`varint`, `varlong`).
+     - File list (`flist`) wire serialization with prefix compression and metadata encoding.
+   - `crates/ssync-cli`:
+     - Server command dispatcher (`--server`, `--sender`).
+     - Remote shell launcher (`ssh`, `-e, --rsh`, or `support/lsh.sh`).
+     - Two-way pipe/socket transport loop between local generator/receiver and remote server.
 3. **Verification**:
-   - Unit tests covering filter patterns, wildmatching, deletion order, and backup file creation.
-   - Run upstream tests: `exclude`, `delete`, `delay-updates`, `backup`, `hardlinks`, `itemize`.
+   - Unit and integration tests for multiplexing, varint wire encoding, and flist serialization.
+   - Run upstream testsuite targets for Phase 4: `00-hello`, `alt-dest`, `ssh-basic`, `hardlinks`.

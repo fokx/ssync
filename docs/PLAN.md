@@ -10,7 +10,7 @@ This document establishes the step-by-step implementation roadmap for building *
 Phase 0: Research, Decisions & Project Scaffolding (Current Session)
    │
    ▼
-Phase 1: Local Recursive File Copy & Traversal
+  Phase 1: Local Recursive File Copy & Traversal
    │  - Directory walking, path semantics (trailing slashes), permissions, mtime, symlinks
    │  - CLI flags: -r, -l, -p, -t, -a, -d, -n, -v, -q
    │
