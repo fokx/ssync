@@ -29,7 +29,7 @@ Upstream reference code (`/f/rsync`, GPL-3.0-or-later) is strictly consulted for
 # Build all crates in the workspace
 cargo build --workspace
 
-# Run all workspace unit tests
+# Run all workspace unit and integration tests
 cargo test --workspace
 
 # Check formatting and clippy
@@ -37,5 +37,24 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Run upstream rsync tests against ssync binary
-./scripts/run_upstream_tests.sh hands
+./scripts/run_upstream_tests.sh hands dirs links relative
 ```
+
+## Supported Flags (Phase 1)
+
+`ssync` currently supports local recursive file transfer and metadata synchronization:
+- `-a, --archive`: Archive mode (equivalent to `-rlptgoD`).
+- `-r, --recursive`: Recurse into directories.
+- `-l, --links`: Copy symlinks as symlinks.
+- `-L, --copy-links`: Dereference symlinks into their referents.
+- `-k, --copy-dirlinks`: Treat symlinked directories as directories.
+- `-p, --perms`: Preserve permissions / mode.
+- `-t, --times`: Preserve modification times (nanosecond precision).
+- `-o, --owner`, `-g, --group`: Preserve owner and group (best effort).
+- `-d, --dirs`: Transfer directories without recursing into them.
+- `-R, --relative`: Relative path replication with `./` cut point support.
+- `--no-implied-dirs`: Implied directories created with default permissions.
+- `-H, --hard-links`: Preserve hard link relationships.
+- `--delete, --del`: Delete extraneous destination files.
+- `--safe-links`, `--copy-unsafe-links`: Path-escape link handling.
+- `-v, --verbose`, `-q, --quiet`, `-n, --dry-run`.

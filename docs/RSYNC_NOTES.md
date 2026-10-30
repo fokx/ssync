@@ -322,3 +322,7 @@ Outputs an 11-character string describing each item's modification:
   - If a file exists during initial tree scan but is deleted before the sender opens it, rsync emits `MSG_NO_SEND`, logs a warning, skips the file, and exits with code `24` (`RERR_VANISHED`) instead of terminating the whole run.
 - **Replacing Directory with File (and vice versa)**:
   - Requires `--force` to delete a non-empty directory when replacing it with a file, symlink, or vice versa.
+- **Unsafe Symlink Detection (`unsafe_symlink` in `util1.c`)**:
+  - Symlinks with absolute targets (starting with `/`) or null targets are always unsafe.
+  - Targets with `..` components other than leading `../` (e.g. `a/a/a/../../../unsafe` or `foo/../bar`) are always rejected as unsafe because intermediate directory components could later become symlinks, leading to an escape.
+  - For clean targets with only leading `../`, the target is unsafe if the count of leading `../` components strictly exceeds the directory depth of the symlink from the transfer root.

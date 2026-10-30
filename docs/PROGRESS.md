@@ -16,11 +16,11 @@ This document tracks implementation status across phases, records upstream test 
   - [x] Baseline upstream test run verified against reference rsync binary.
   - [x] Cargo workspace initialized with compiling skeletons, formatting, clippy, CI workflow.
   - [x] Initial git commit created on clean branch.
-- [ ] **Phase 1: Local Recursive File Copy & Traversal**
-  - [ ] Implement `ssync-fs` path handling & directory walker.
-  - [ ] Implement basic metadata reader/writer (mode, mtime, symlinks).
-  - [ ] Implement `ssync-cli` argument parser matching rsync subset (`-a, -r, -l, -p, -t, -d, -v, -q, -n`).
-  - [ ] Pass target upstream tests: `hands`, `dirs`, `links`, `trimslash`, `relative`.
+- [x] **Phase 1: Local Recursive File Copy & Traversal**
+  - [x] Implement `ssync-fs` path handling & directory walker (`crates/ssync-fs/src/walker.rs`, `path.rs`).
+  - [x] Implement basic metadata reader/writer (mode, mtime with nanoseconds, symlinks, `apply_to` in `metadata.rs`).
+  - [x] Implement `ssync-cli` argument parser matching rsync subset (`-a, -r, -l, -L, -k, -K, -p, -t, -o, -g, -D, -d, -v, -q, -n, -R, --no-implied-dirs, -H, --delete/--del, --existing, -i, --include, --exclude, --copy-unsafe-links, --safe-links`).
+  - [x] Pass target upstream tests: `hands`, `dirs`, `links`, `trimslash`, `relative` (plus `relative-content`, `relative-implied`, `symlink-ignore`, `longdir`, `unsafe-links`, `safe-links`, `safe-links-absolute-intree`, `safe-links-unsafe-def`, `duplicates`, `clean-fname-underflow`, `skiplist-spec`).
 - [ ] **Phase 2: Delta-Transfer Algorithm & Checksum Engine**
   - [ ] Implement `Checksum1` rolling checksum in `ssync-core`.
   - [ ] Implement strong hash abstraction (MD5, XXH64, SHA1).
@@ -50,20 +50,31 @@ This document tracks implementation status across phases, records upstream test 
 
 | Test Name | Classification | Current Status | Passing Phase | Notes |
 |-----------|----------------|----------------|---------------|-------|
-| `hands` | Required | Baseline Passed (upstream) | Phase 1 | Canonical recursive tree transfer |
-| `dirs` | Required | Baseline Passed (upstream) | Phase 1 | Non-recursive directory transfer (`-d`) |
-| `links` | Required | Baseline Passed (upstream) | Phase 1 | Symlink preservation (`-l, -L, -k`) |
-| `trimslash` | Required | Baseline Passed (upstream) | Phase 1 | Trailing slash path semantics |
-| `relative` | Required | Baseline Passed (upstream) | Phase 1 | Relative and implied directory paths (`-R`) |
-| `compare` | Required | Baseline Passed (upstream) | Phase 2 | Checksum comparison and skip rules (`-c, -I`) |
-| `update` | Required | Baseline Passed (upstream) | Phase 2 | Update-only semantics (`-u`) |
+| `hands` | Required | **Passed** | Phase 1 | Canonical recursive tree transfer |
+| `dirs` | Required | **Passed** | Phase 1 | Non-recursive directory transfer (`-d`) |
+| `links` | Required | **Passed** | Phase 1 | Symlink preservation (`-l, -L, -k`) |
+| `trimslash` | Required | **Passed** | Phase 1 | Trailing slash path semantics |
+| `relative` | Required | **Passed** | Phase 1 | Relative and implied directory paths (`-R`) |
+| `relative-content` | Required | **Passed** | Phase 1 | Relative path content delivery |
+| `relative-implied` | Required | **Passed** | Phase 1 | Implied directories and `--no-implied-dirs` |
+| `symlink-ignore` | Required | **Passed** | Phase 1 | Default behavior ignoring symlinks without `-l/-L/-a` |
+| `longdir` | Required | **Passed** | Phase 1 | Deep nested directory traversal |
+| `unsafe-links` | Required | **Passed** | Phase 1 | Unsafe link policy & `--copy-unsafe-links` |
+| `safe-links` | Required | **Passed** | Phase 1 | Dropping unsafe escaping links under `--safe-links` |
+| `safe-links-absolute-intree` | Required | **Passed** | Phase 1 | Absolute symlinks dropped under `--safe-links` |
+| `safe-links-unsafe-def` | Required | **Passed** | Phase 1 | Validation of unsafe symlink definitions |
+| `duplicates` | Required | **Passed** | Phase 1 | Deduplication of duplicate command line sources |
+| `clean-fname-underflow` | Required | **Passed** | Phase 1 | Path component sanitization without underflow |
+| `skiplist-spec` | Required | **Passed** | Phase 1 | Harness skip list parsing |
+| `compare` | Required | Pending | Phase 2 | Checksum comparison and skip rules (`-c, -I`) |
+| `update` | Required | Pending | Phase 2 | Update-only semantics (`-u`) |
 | `append` | Required | Pending | Phase 2 | In-place append verification |
 | `inplace` | Required | Pending | Phase 2 | In-place block updating |
-| `merge` | Required | Baseline Passed (upstream) | Phase 3 | Multi-source merge into single target |
+| `merge` | Required | Pending | Phase 3 | Multi-source merge into single target |
 | `exclude` | Required | Pending | Phase 3 | Exclude and filter rule evaluation |
-| `delete` | Required | Baseline Passed (upstream) | Phase 3 | Deletion modes |
-| `hardlinks` | Required | Baseline Passed (upstream) | Phase 3 | Hardlink detection and creation (`-H`) |
-| `itemize` | Required | Baseline Passed (upstream) | Phase 3 | Itemized changes output (`-i`) |
+| `delete` | Required | Pending | Phase 3 | Deletion modes |
+| `hardlinks` | Required | Pending | Phase 3 | Hardlink detection and creation (`-H`) |
+| `itemize` | Required | Pending | Phase 3 | Itemized changes output (`-i`) |
 | `00-hello` | Deferred | Pending | Phase 4 | Remote server smoke test |
 
 *(Full mapping of all 374 upstream tests is maintained in `docs/TESTSUITE_MAP.md`)*
@@ -79,11 +90,18 @@ This document tracks implementation status across phases, records upstream test 
 
 ---
 
-## 4. Notes for Next Session (Phase 1)
+## 4. Notes for Next Session (Phase 2: Delta-Transfer Algorithm & Checksum Engine)
 
-1. **Immediate Focus**: Implement Phase 1: Local Recursive File Copy & Traversal.
-2. **Key Crates to Populate**:
-   - `crates/ssync-fs`: Implement directory scanner (`walkdir` or recursive `std::fs::read_dir`) capturing path, metadata (`st_mode`, `mtime`, `size`), and symlink target.
-   - `crates/ssync-cli`: Set up `clap` CLI flags matching the Phase 1 subset: `-r, -l, -p, -t, -o, -g, -a, -d, -n, -v, -q`.
-   - Wire up the local copy loop: iterate scanned files, create directories, copy regular files, recreate symlinks, set metadata.
-3. **Verification**: Run `scripts/run_upstream_tests.sh hands dirs links relative` and verify they pass cleanly.
+1. **Immediate Focus**: Implement Phase 2: Delta-Transfer Algorithm & Checksum Engine.
+2. **Key Components to Implement**:
+   - `crates/ssync-core`:
+     - Sliding window rolling checksum (`Checksum1`, Adler32-variant with `CHAR_OFFSET = 0`).
+     - Strong hash digests abstraction (MD5, XXH64, SHA1).
+     - Bounded hash table block search (`hash_table[SUM2HASH(sum1)]`) with max chain length limit (1024).
+     - Streaming literal and token generator.
+     - Delta reconstruction applying basis blocks and literal chunks.
+   - `crates/ssync-cli`:
+     - Flags: `-c, --checksum`, `-u, --update`, `-I, --ignore-times`, `--size-only`, `--modify-window`, `--inplace`, `--append`, `--append-verify`.
+3. **Verification**:
+   - Property tests via `proptest` verifying arbitrary basis + modified delta reconstruct bit-for-bit identical content.
+   - Run upstream tests: `compare`, `update`, `append`, `inplace`, `hashsearch-chain`, `hashsearch-collision-skip`.

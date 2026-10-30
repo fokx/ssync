@@ -1,7 +1,10 @@
 //! ssync-fs: Local filesystem operations, metadata preservation, and path handling.
 
+pub mod filter;
 pub mod metadata;
 pub mod path;
+pub mod sync;
+pub mod walker;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {

@@ -1,0 +1,124 @@
+use ssync_fs::filter::FilterSet;
+use ssync_fs::metadata::{FileMetadata, FileType};
+use ssync_fs::path::SourcePath;
+use ssync_fs::sync::{SyncEngine, SyncOptions};
+use ssync_fs::walker::{WalkOptions, Walker};
+use std::fs;
+use tempfile::tempdir;
+
+#[test]
+fn test_recursive_tree_sync() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(src.join("subdir")).unwrap();
+    fs::write(src.join("file1"), b"content 1").unwrap();
+    fs::write(src.join("subdir/file2"), b"content 2").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        links: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        preserve_perms: true,
+        preserve_times: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert_eq!(fs::read(dest.join("file1")).unwrap(), b"content 1");
+    assert_eq!(fs::read(dest.join("subdir/file2")).unwrap(), b"content 2");
+}
+
+#[test]
+fn test_symlink_and_hardlink_preservation() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    let f1 = src.join("orig");
+    fs::write(&f1, b"hardlink data").unwrap();
+    let hl = src.join("hlink");
+    fs::hard_link(&f1, &hl).unwrap();
+    let sl = src.join("slink");
+    std::os::unix::fs::symlink("orig", &sl).unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        links: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        hard_links: true,
+        preserve_perms: true,
+        preserve_times: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // Verify symlink
+    let dest_sl = dest.join("slink");
+    assert!(dest_sl.is_symlink());
+    assert_eq!(
+        fs::read_link(&dest_sl).unwrap(),
+        std::path::PathBuf::from("orig")
+    );
+
+    // Verify hardlink (same inode)
+    let m1 = FileMetadata::from_path(&dest.join("orig"), false).unwrap();
+    let m2 = FileMetadata::from_path(&dest.join("hlink"), false).unwrap();
+    assert_eq!(m1.file_type, FileType::Regular);
+    assert_eq!(m2.file_type, FileType::Regular);
+    assert_eq!(m1.ino, m2.ino);
+    assert_eq!(m1.dev, m2.dev);
+}
+
+#[test]
+fn test_filter_and_deletion() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(src.join("keep.txt"), b"keep me").unwrap();
+    fs::write(src.join("exclude.log"), b"ignore me").unwrap();
+    fs::write(dest.join("stray.txt"), b"delete me").unwrap();
+
+    let mut filters = FilterSet::new();
+    filters.add_exclude("*.log");
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        filters,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        delete: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("keep.txt").exists());
+    assert!(!dest.join("exclude.log").exists());
+    assert!(!dest.join("stray.txt").exists());
+}
