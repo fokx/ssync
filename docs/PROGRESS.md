@@ -21,12 +21,13 @@ This document tracks implementation status across phases, records upstream test 
   - [x] Implement basic metadata reader/writer (mode, mtime with nanoseconds, symlinks, `apply_to` in `metadata.rs`).
   - [x] Implement `ssync-cli` argument parser matching rsync subset (`-a, -r, -l, -L, -k, -K, -p, -t, -o, -g, -D, -d, -v, -q, -n, -R, --no-implied-dirs, -H, --delete/--del, --existing, -i, --include, --exclude, --copy-unsafe-links, --safe-links`).
   - [x] Pass target upstream tests: `hands`, `dirs`, `links`, `trimslash`, `relative` (plus `relative-content`, `relative-implied`, `symlink-ignore`, `longdir`, `unsafe-links`, `safe-links`, `safe-links-absolute-intree`, `safe-links-unsafe-def`, `duplicates`, `clean-fname-underflow`, `skiplist-spec`).
-- [ ] **Phase 2: Delta-Transfer Algorithm & Checksum Engine**
-  - [ ] Implement `Checksum1` rolling checksum in `ssync-core`.
-  - [ ] Implement strong hash abstraction (MD5, XXH64, SHA1).
-  - [ ] Implement block search hash table and token/literal generator.
-  - [ ] Integrate delta reconstruction into file updater.
-  - [ ] Pass target upstream tests: `compare`, `update`, `append`, `inplace`.
+- [x] **Phase 2: Delta-Transfer Algorithm & Checksum Engine**
+  - [x] Implement `Checksum1` rolling checksum in `ssync-core` (`crates/ssync-core/src/checksum.rs`).
+  - [x] Implement strong hash abstraction (MD5, MD4, XXH64, SHA1) with seed support and whole-file checksumming.
+  - [x] Implement block search hash table, collision chain capping (`MAX_CHAIN_LEN = 1024`), duplicate chain unlinking (issue #1115), and 4-offset collision skip heuristic (`crates/ssync-core/src/delta.rs`).
+  - [x] Implement delta token generator and full reconstructor with property-based proptest roundtrip verification.
+  - [x] Integrate quick-check comparison (`-c, --checksum`, `-u, --update`, `-I, --ignore-times`, `--size-only`, `--modify-window`), `--max-size`, `--min-size`, and staging modes (`--inplace`, `--append`, `--append-verify`, temporary file staging).
+  - [x] Pass target upstream tests: `compare`, `update`, `append`, `inplace`, `hashsearch-chain`, `hashsearch-collision-skip`, `hashsearch-dup-chain`, `size-filter`.
 - [ ] **Phase 3: Filters, Deletion & Advanced Local Synchronization**
   - [ ] Implement filter rule parser and wildmatch engine.
   - [ ] Implement deletion logic (`--delete`, `--delete-before/during/delay/after`).
@@ -66,10 +67,14 @@ This document tracks implementation status across phases, records upstream test 
 | `duplicates` | Required | **Passed** | Phase 1 | Deduplication of duplicate command line sources |
 | `clean-fname-underflow` | Required | **Passed** | Phase 1 | Path component sanitization without underflow |
 | `skiplist-spec` | Required | **Passed** | Phase 1 | Harness skip list parsing |
-| `compare` | Required | Pending | Phase 2 | Checksum comparison and skip rules (`-c, -I`) |
-| `update` | Required | Pending | Phase 2 | Update-only semantics (`-u`) |
-| `append` | Required | Pending | Phase 2 | In-place append verification |
-| `inplace` | Required | Pending | Phase 2 | In-place block updating |
+| `compare` | Required | **Passed** | Phase 2 | Checksum comparison and skip rules (`-c, -I, --size-only, --modify-window`) |
+| `update` | Required | **Passed** | Phase 2 | Update-only semantics (`-u`) and directory replacement (`--force`) |
+| `append` | Required | **Passed** | Phase 2 | In-place append verification (`--append`, `--append-verify`) |
+| `inplace` | Required | **Passed** | Phase 2 | In-place block updating preserving inode |
+| `hashsearch-chain` | Required | **Passed** | Phase 2 | Bounded hash table collision search with chain cap |
+| `hashsearch-collision-skip` | Required | **Passed** | Phase 2 | Collision flood skip boundary preservation and statistics |
+| `hashsearch-dup-chain` | Required | **Passed** | Phase 2 | Duplicate colliding chain unlinking (issue #1115) |
+| `size-filter` | Required | **Passed** | Phase 2 | Size threshold filtering (`--max-size`, `--min-size`) |
 | `merge` | Required | Pending | Phase 3 | Multi-source merge into single target |
 | `exclude` | Required | Pending | Phase 3 | Exclude and filter rule evaluation |
 | `delete` | Required | Pending | Phase 3 | Deletion modes |
@@ -90,18 +95,16 @@ This document tracks implementation status across phases, records upstream test 
 
 ---
 
-## 4. Notes for Next Session (Phase 2: Delta-Transfer Algorithm & Checksum Engine)
+## 4. Notes for Next Session (Phase 3: Filters, Deletion & Advanced Local Synchronization)
 
-1. **Immediate Focus**: Implement Phase 2: Delta-Transfer Algorithm & Checksum Engine.
+1. **Immediate Focus**: Implement Phase 3: Filters, Deletion & Advanced Local Synchronization.
 2. **Key Components to Implement**:
-   - `crates/ssync-core`:
-     - Sliding window rolling checksum (`Checksum1`, Adler32-variant with `CHAR_OFFSET = 0`).
-     - Strong hash digests abstraction (MD5, XXH64, SHA1).
-     - Bounded hash table block search (`hash_table[SUM2HASH(sum1)]`) with max chain length limit (1024).
-     - Streaming literal and token generator.
-     - Delta reconstruction applying basis blocks and literal chunks.
-   - `crates/ssync-cli`:
-     - Flags: `-c, --checksum`, `-u, --update`, `-I, --ignore-times`, `--size-only`, `--modify-window`, `--inplace`, `--append`, `--append-verify`.
+   - `crates/ssync-fs`:
+     - Full filter and wildmatch parser matching rsync pattern rules (`+`, `-`, `!`, `:`, `.`, `dir-merge`, CVS exclude `-C`).
+     - Deletion engine: `--delete`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--max-delete`.
+     - Advanced staging & atomic update modes: `--delay-updates` (staging in `.~tmp~` folders), `--partial`, `--partial-dir`, `-b, --backup`, `--backup-dir`, `--suffix`.
+     - Hardlink preservation (`-H, --hard-links`) tracking and link creation.
+     - Full 11-character itemize changes output format (`-i, --itemize-changes`) and transfer stats (`--stats`).
 3. **Verification**:
-   - Property tests via `proptest` verifying arbitrary basis + modified delta reconstruct bit-for-bit identical content.
-   - Run upstream tests: `compare`, `update`, `append`, `inplace`, `hashsearch-chain`, `hashsearch-collision-skip`.
+   - Unit tests covering filter patterns, wildmatching, deletion order, and backup file creation.
+   - Run upstream tests: `exclude`, `delete`, `delay-updates`, `backup`, `hardlinks`, `itemize`.

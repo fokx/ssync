@@ -40,9 +40,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/run_upstream_tests.sh hands dirs links relative
 ```
 
-## Supported Flags (Phase 1)
+## Supported Flags (Phase 1 & Phase 2)
 
-`ssync` currently supports local recursive file transfer and metadata synchronization:
+`ssync` currently supports local recursive file transfer, metadata synchronization, and delta transfers:
 - `-a, --archive`: Archive mode (equivalent to `-rlptgoD`).
 - `-r, --recursive`: Recurse into directories.
 - `-l, --links`: Copy symlinks as symlinks.
@@ -54,7 +54,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 - `-d, --dirs`: Transfer directories without recursing into them.
 - `-R, --relative`: Relative path replication with `./` cut point support.
 - `--no-implied-dirs`: Implied directories created with default permissions.
+- `-c, --checksum`: Skip-check based on whole-file strong checksum rather than mtime + size.
+- `-u, --update`: Skip files that are newer on the destination.
+- `-I, --ignore-times`: Disable quick check; transfer all files.
+- `--size-only`: Skip files that match in size, ignoring mtime.
+- `--modify-window=N`: Timestamp equivalence window in seconds (default: 0).
+- `--inplace`: Update destination files in-place without staging temp file.
+- `--append`: Append data onto shorter files without rewriting prefix.
+- `--append-verify`: Append data with whole-file checksum verification, re-sending on mismatch.
+- `--force`: Force removal of non-empty destination directories when replaced by regular files.
+- `--max-size=SIZE`, `--min-size=SIZE`: Transfer only files within byte size thresholds.
+- `--block-size=N`: Set fixed checksum block size for delta matching.
+- `--stats`: Output transfer statistics (literal data, matched data).
 - `-H, --hard-links`: Preserve hard link relationships.
 - `--delete, --del`: Delete extraneous destination files.
 - `--safe-links`, `--copy-unsafe-links`: Path-escape link handling.
+- `-i, --itemize-changes`: 11-character itemized change summary.
 - `-v, --verbose`, `-q, --quiet`, `-n, --dry-run`.

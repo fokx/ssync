@@ -180,6 +180,8 @@ Rsync operates across three primary processes, configured depending on the trans
 2. **Sender (`sender.c`, `match.c`)**:
    - Receives block checksums and constructs a 16-bit hash table (`hash_table[SUM2HASH(sum1)]`).
    - Chains collisions with `MAX_CHAIN_LEN = 1024` cap (prevents $O(N^2)$ collision flood DoS).
+   - Duplicate unlinking (`issue #1115`): If consecutive candidate entries in a chain share identical `sum2` with a preceding false alarm, unlinks them immediately without consuming `MAX_CHAIN_LEN` budget or incrementing `false_alarms`.
+   - Collision skip heuristic: When 4 consecutive false offsets occur on strong checksum comparison (or chain exceeds `MAX_CHAIN_LEN`), skips forward `min(k - 1, end - 1 - offset)` bytes, recomputes rolling checksum at that landing offset, and then advances by 1 byte.
    - Slides rolling checksum window over the source file.
    - On match failure: slides forward 1 byte, accumulating literal data.
    - On match hit: verifies `sum2`. If valid, transmits pending literal buffer, then emits block token `-(block_index + 1)`.
@@ -205,11 +207,15 @@ Rsync operates across three primary processes, configured depending on the trans
 
 ### Quick-Check Comparison Semantics (`generator.c` `quick_check_ok`)
 - Default check: File is skipped if `destination.st_size == source.length` AND `mtime_differs(dst, src) == false`.
+- Timestamp comparison (`same_time` in `util1.c`):
+  - When `--modify-window == 0` (default): Compares integer seconds only (`f1_sec == f2_sec`). Nanoseconds are ignored.
+  - When `--modify-window < 0`: Compares exact nanoseconds (`f1_sec == f2_sec && f1_nsec == f2_nsec`).
+  - When `--modify-window > 0`: Tolerates timestamp differences within $\pm W$ seconds (`|f1_sec - f2_sec| <= W`).
 - If `-c, --checksum`: Size is checked; if equal, destination file is read and its full strong digest compared with `F_SUM(src)`.
 - If `--size-only`: File is considered unchanged if `st_size` matches, ignoring mtime.
 - If `-I, --ignore-times`: Quick check is disabled; every file is subjected to delta transfer.
-- If `-u, --update`: Destination file is skipped if its mtime is newer than source.
-- `--modify-window`: Tolerates timestamp differences within $\pm W$ seconds (essential for FAT/exFAT 2-second granularity).
+- If `-u, --update`: Destination file is skipped if its mtime is newer than source. Non-regular destination files (e.g. symlinks) are never skipped by `-u`.
+- Single-file destination semantics: When syncing a single source file and the destination path exists as a regular file or does not end with `/` and is not an existing directory, the destination is treated as a target file rather than a target directory.
 
 ### Server Command Line Construction (`options.c` `server_options`, `maybe_add_e_option`)
 - When launching remote server via SSH, the client constructs a compact argument vector:

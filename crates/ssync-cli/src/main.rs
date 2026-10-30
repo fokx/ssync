@@ -72,6 +72,62 @@ struct Cli {
     #[arg(short = 'd', long = "dirs")]
     dirs: bool,
 
+    /// Skip based on checksum, not mod-time & size
+    #[arg(short = 'c', long = "checksum")]
+    checksum: bool,
+
+    /// Skip files that are newer on the receiver
+    #[arg(short = 'u', long = "update")]
+    update: bool,
+
+    /// Don't skip files that match size and time
+    #[arg(short = 'I', long = "ignore-times")]
+    ignore_times: bool,
+
+    /// Skip files that match in size
+    #[arg(long = "size-only")]
+    size_only: bool,
+
+    /// Compare mod-times with reduced accuracy
+    #[arg(long = "modify-window", default_value_t = 0)]
+    modify_window: i32,
+
+    /// Update destination files in-place
+    #[arg(long = "inplace")]
+    inplace: bool,
+
+    /// Append data onto shorter files
+    #[arg(long = "append")]
+    append: bool,
+
+    /// --append with checksum of the existing data
+    #[arg(long = "append-verify")]
+    append_verify: bool,
+
+    /// Force deletion of dirs even if not empty
+    #[arg(long = "force")]
+    force: bool,
+
+    /// Force a fixed checksum block-size
+    #[arg(short = 'B', long = "block-size")]
+    block_size: Option<usize>,
+
+    /// Don't transfer any file larger than SIZE
+    #[arg(long = "max-size")]
+    max_size: Option<String>,
+
+    /// Don't transfer any file smaller than SIZE
+    #[arg(long = "min-size")]
+    min_size: Option<String>,
+
+    /// Print a set of transfer statistics
+    #[arg(long = "stats")]
+    stats: bool,
+
+    /// Do not compress data
+    #[arg(long = "no-compress")]
+    no_compress: bool,
+
     /// Use relative path names
     #[arg(short = 'R', long = "relative")]
     pub relative: bool,
@@ -128,7 +184,7 @@ struct Cli {
     #[arg(long = "bwlimit")]
     bwlimit: Option<String>,
 
-    /// Debug options (compatibility placeholder)
+    /// Debug options
     #[arg(long = "debug")]
     debug: Option<String>,
 
@@ -143,6 +199,35 @@ struct Cli {
     /// Source and destination paths
     #[arg(required = false)]
     paths: Vec<String>,
+}
+
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let mut num_str = s;
+    let mut multiplier: u64 = 1;
+
+    if let Some(rest) = s.strip_suffix(&['b', 'B'][..]) {
+        num_str = rest;
+    }
+
+    if let Some(rest) = num_str.strip_suffix(&['k', 'K'][..]) {
+        num_str = rest;
+        multiplier = 1024;
+    } else if let Some(rest) = num_str.strip_suffix(&['m', 'M'][..]) {
+        num_str = rest;
+        multiplier = 1024 * 1024;
+    } else if let Some(rest) = num_str.strip_suffix(&['g', 'G'][..]) {
+        num_str = rest;
+        multiplier = 1024 * 1024 * 1024;
+    } else if let Some(rest) = num_str.strip_suffix(&['t', 'T'][..]) {
+        num_str = rest;
+        multiplier = 1024 * 1024 * 1024 * 1024;
+    }
+
+    let val: u64 = num_str
+        .parse()
+        .map_err(|e| format!("Invalid size '{}': {}", s, e))?;
+    Ok(val.saturating_mul(multiplier))
 }
 
 fn main() {
@@ -203,6 +288,24 @@ fn main() {
     let owner = cli.owner || cli.archive;
     let group = cli.group || cli.archive;
 
+    let dest_is_file = sources.len() == 1
+        && !sources[0].path.is_dir()
+        && !cli.relative
+        && (dest_path.is_file() || (!dest_raw.ends_with('/') && !dest_path.is_dir()));
+
+    let max_size = cli.max_size.as_deref().map(|s| {
+        parse_size(s).unwrap_or_else(|e| {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        })
+    });
+    let min_size = cli.min_size.as_deref().map(|s| {
+        parse_size(s).unwrap_or_else(|e| {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        })
+    });
+
     let walk_opts = WalkOptions {
         recursive,
         dirs: cli.dirs,
@@ -214,6 +317,9 @@ fn main() {
         relative: cli.relative,
         no_implied_dirs: cli.no_implied_dirs,
         filters,
+        dest_is_file,
+        max_size,
+        min_size,
     };
 
     let walker = Walker::new(walk_opts);
@@ -237,6 +343,21 @@ fn main() {
         existing: cli.existing,
         delete: cli.delete,
         itemize_changes: cli.itemize_changes,
+        checksum: cli.checksum,
+        update: cli.update,
+        ignore_times: cli.ignore_times,
+        size_only: cli.size_only,
+        modify_window: cli.modify_window,
+        inplace: cli.inplace,
+        append: cli.append,
+        append_verify: cli.append_verify,
+        force: cli.force,
+        block_size: cli.block_size,
+        no_whole_file: cli.no_whole_file,
+        whole_file: cli.whole_file,
+        stats: cli.stats,
+        debug: cli.debug,
+        dest_is_file,
     };
 
     let engine = SyncEngine::new(sync_opts);

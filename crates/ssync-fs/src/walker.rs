@@ -21,6 +21,9 @@ pub struct WalkOptions {
     pub relative: bool,
     pub no_implied_dirs: bool,
     pub filters: FilterSet,
+    pub dest_is_file: bool,
+    pub max_size: Option<u64>,
+    pub min_size: Option<u64>,
 }
 
 /// Represents an item scheduled for transfer.
@@ -157,11 +160,15 @@ impl Walker {
                 }
             } else {
                 // Single file/symlink transfer
-                let file_name = source
-                    .path
-                    .file_name()
-                    .ok_or_else(|| FsError::PathError("Invalid file name".to_string()))?;
-                let rel_dest = PathBuf::from(file_name);
+                let rel_dest = if self.options.dest_is_file {
+                    PathBuf::from("")
+                } else {
+                    let file_name = source
+                        .path
+                        .file_name()
+                        .ok_or_else(|| FsError::PathError("Invalid file name".to_string()))?;
+                    PathBuf::from(file_name)
+                };
                 self.scan_path(&source.path, &rel_dest, entries, seen_dest_paths)?;
             }
         }
@@ -255,6 +262,20 @@ impl Walker {
         // Symlink filter check
         if meta.file_type == FileType::Symlink && !self.options.links && !self.options.copy_links {
             return Ok(());
+        }
+
+        // Size filter check for regular files
+        if meta.file_type == FileType::Regular {
+            if let Some(max_s) = self.options.max_size {
+                if meta.size > max_s {
+                    return Ok(());
+                }
+            }
+            if let Some(min_s) = self.options.min_size {
+                if meta.size < min_s {
+                    return Ok(());
+                }
+            }
         }
 
         if is_dir {
