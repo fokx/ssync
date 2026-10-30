@@ -1,0 +1,26 @@
+/target/
+Cargo.lock
+
+# IDE & Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test scratch directories & upstream artifacts
+testtmp/
+target/upstream-tooldir/
+*.corrupt.*
+valgrind-logs/
+
+# Perf, profiling & flamegraphs
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
