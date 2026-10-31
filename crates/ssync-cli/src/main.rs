@@ -9,6 +9,8 @@ use ssync_fs::walker::{WalkOptions, Walker};
 use std::path::{Path, PathBuf};
 use std::process;
 
+mod wire;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "ssync",
@@ -317,6 +319,34 @@ struct Cli {
     #[arg(short = 'W', long = "whole-file")]
     whole_file: bool,
 
+    /// Run as a remote server
+    #[arg(long = "server")]
+    server: bool,
+
+    /// Server acts as sender
+    #[arg(long = "sender")]
+    sender: bool,
+
+    /// Protect remote arguments from shell expansion
+    #[arg(short = 's', long = "protect-args", alias = "secluded-args")]
+    protect_args: bool,
+
+    /// Pass arguments to remote shell unquoted
+    #[arg(long = "old-args")]
+    old_args: bool,
+
+    /// Maximum memory allocation
+    #[arg(long = "max-alloc")]
+    max_alloc: Option<String>,
+
+    /// Compress file data during the transfer
+    #[arg(short = 'z', long = "compress")]
+    compress: bool,
+
+    /// Skip compression for specified suffixes
+    #[arg(long = "skip-compress")]
+    skip_compress: Option<String>,
+
     /// Source and destination paths
     #[arg(required = false)]
     paths: Vec<String>,
@@ -351,6 +381,68 @@ fn parse_size(s: &str) -> Result<u64, String> {
     Ok(val.saturating_mul(multiplier))
 }
 
+const INFO_HELP: &str = r#"Use OPT or OPT1 for level 1 output, OPT2 for level 2, etc.; OPT0 silences.
+
+BACKUP     Mention files backed up
+COPY       Mention files copied locally on the receiving side
+DEL        Mention deletions on the receiving side
+FLIST      Mention file-list receiving/sending (levels 1-2)
+MISC       Mention miscellaneous information (levels 1-2)
+MOUNT      Mention mounts that were found or skipped
+NAME       Mention 1) updated file/dir names, 2) unchanged names
+NONREG     Mention skipped non-regular files (default 1, 0 disables)
+PROGRESS   Mention 1) per-file progress or 2) total transfer progress
+REMOVE     Mention files removed on the sending side
+SKIP       Mention files skipped due to transfer overrides (levels 1-2)
+STATS      Mention statistics at end of run (levels 1-3)
+SYMSAFE    Mention symlinks that are unsafe
+
+ALL        Set all --info options (e.g. all4)
+NONE       Silence all --info options (same as all0)
+HELP       Output this help message
+
+Options added at each level of verbosity:
+0) NONREG
+1) COPY,DEL,FLIST,MISC,NAME,STATS,SYMSAFE
+2) BACKUP,MISC2,MOUNT,NAME2,REMOVE,SKIP"#;
+
+const DEBUG_HELP: &str = r#"Use OPT or OPT1 for level 1 output, OPT2 for level 2, etc.; OPT0 silences.
+
+ACL        Debug extra ACL info
+BACKUP     Debug backup actions (levels 1-2)
+BIND       Debug socket bind actions
+CHDIR      Debug when the current directory changes
+CONNECT    Debug connection events (levels 1-2)
+CMD        Debug commands+options that are issued (levels 1-2)
+DEL        Debug delete actions (levels 1-3)
+DELTASUM   Debug delta-transfer checksumming (levels 1-4)
+DUP        Debug weeding of duplicate names
+EXIT       Debug exit events (levels 1-3)
+FILTER     Debug filter actions (levels 1-3)
+FLIST      Debug file-list operations (levels 1-4)
+FUZZY      Debug fuzzy scoring (levels 1-2)
+GENR       Debug generator functions
+HASH       Debug hashtable code
+HLINK      Debug hard-link actions (levels 1-3)
+ICONV      Debug iconv character conversions (levels 1-2)
+IO         Debug I/O routines (levels 1-4)
+NSTR       Debug negotiation strings
+OWN        Debug ownership changes in users & groups (levels 1-2)
+PROTO      Debug protocol information
+RECV       Debug receiver functions
+SEND       Debug sender functions
+TIME       Debug setting of modified times (levels 1-2)
+
+ALL        Set all --debug options (e.g. all4)
+NONE       Silence all --debug options (same as all0)
+HELP       Output this help message
+
+Options added at each level of verbosity:
+2) BIND,CONNECT,CMD,DEL,DELTASUM,DUP,FILTER,FLIST,ICONV
+3) ACL,BACKUP,CONNECT2,DEL2,DELTASUM2,EXIT,FILTER2,FLIST2,FUZZY,GENR,OWN,RECV,SEND,TIME
+4) CMD2,DEL3,DELTASUM3,EXIT2,FLIST3,ICONV2,OWN2,PROTO,TIME2
+5) CHDIR,DELTASUM4,FLIST4,FUZZY2,HASH,HLINK"#;
+
 fn main() {
     let cli = Cli::parse();
 
@@ -369,9 +461,119 @@ fn main() {
         return;
     }
 
+    if let Some(ref info) = cli.info {
+        if info == "help" || info.starts_with("help") {
+            println!("{}", INFO_HELP);
+            return;
+        }
+    }
+
+    if let Some(ref debug) = cli.debug {
+        if debug == "help" || debug.starts_with("help") {
+            println!("{}", DEBUG_HELP);
+            return;
+        }
+    }
+
+    if let Some(ref m) = cli.max_alloc {
+        if m != "0" {
+            let mut num_str = m.as_str();
+            let mut multiplier: u64 = 1;
+            if let Some(rest) = num_str.strip_suffix(&['b', 'B'][..]) {
+                num_str = rest;
+            }
+            if let Some(rest) = num_str.strip_suffix(&['k', 'K'][..]) {
+                num_str = rest;
+                multiplier = 1024;
+            } else if let Some(rest) = num_str.strip_suffix(&['m', 'M'][..]) {
+                num_str = rest;
+                multiplier = 1024 * 1024;
+            } else if let Some(rest) = num_str.strip_suffix(&['g', 'G'][..]) {
+                num_str = rest;
+                multiplier = 1024 * 1024 * 1024;
+            } else if let Some(rest) = num_str.strip_suffix(&['t', 'T'][..]) {
+                num_str = rest;
+                multiplier = 1024 * 1024 * 1024 * 1024;
+            } else if let Some(rest) = num_str.strip_suffix(&['p', 'P'][..]) {
+                num_str = rest;
+                multiplier = 1024 * 1024 * 1024 * 1024 * 1024;
+            }
+
+            match num_str.parse::<u64>() {
+                Ok(val) => {
+                    let total = val.checked_mul(multiplier);
+                    let max_allowed = (usize::MAX / 2) as u64;
+                    if total.is_none() || total.unwrap() > max_allowed {
+                        eprintln!("ssync: --max-alloc={} is too large", m);
+                        process::exit(1);
+                    }
+                    let bytes = total.unwrap();
+                    if bytes < 1024 * 1024 {
+                        eprintln!(
+                            "ssync: --max-alloc={} is too small (min: 1.00Mi or 0 for unlimited)",
+                            m
+                        );
+                        process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("ssync: --max-alloc={} is too large", m);
+                    process::exit(1);
+                }
+            }
+        }
+    }
+
+    if cli.server {
+        if let Err(e) = wire::run_wire_server(
+            cli.sender,
+            cli.protect_args,
+            cli.delete,
+            &cli.paths,
+            cli.itemize_changes > 0,
+            cli.perms || cli.archive,
+            cli.times || cli.archive,
+        ) {
+            eprintln!("ssync [server]: {:#}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     if cli.paths.len() < 2 {
         eprintln!("ssync: missing source or destination parameters");
         process::exit(1);
+    }
+
+    let old_args = cli.old_args
+        || std::env::var("RSYNC_OLD_ARGS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+    let has_remote = cli
+        .paths
+        .iter()
+        .any(|p| wire::parse_remote_path(p).is_some());
+    if has_remote {
+        let dest_raw = cli.paths.last().unwrap();
+        let sources_raw = &cli.paths[..cli.paths.len() - 1];
+        if let Err(e) = wire::run_wire_client(
+            sources_raw,
+            dest_raw,
+            cli.rsh.as_deref(),
+            cli.rsync_path.as_deref(),
+            cli.protect_args,
+            old_args,
+            cli.delete,
+            cli.itemize_changes > 0,
+            cli.perms || cli.archive,
+            cli.times || cli.archive,
+            cli.max_alloc.as_deref(),
+        ) {
+            eprintln!("ssync [client]: {:#}", e);
+            process::exit(1);
+        }
+        return;
     }
 
     let dest_raw = cli.paths.last().unwrap();

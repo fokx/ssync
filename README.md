@@ -40,9 +40,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/run_upstream_tests.sh hands dirs links relative
 ```
 
-## Supported Flags (Phase 1, Phase 2 & Phase 3)
+## Supported Flags (Phase 1, Phase 2, Phase 3 & Phase 4)
 
-`ssync` currently supports local recursive file transfer, metadata synchronization, delta transfers, and advanced filtering/staging:
+`ssync` currently supports local and remote recursive file transfer, metadata synchronization, delta transfers, advanced filtering/staging, and wire protocol 31:
+- Remote synchronization: `[user@]host:path` source and destination syntax over SSH or custom remote shells (`-e, --rsh`, `$RSYNC_RSH`).
+- `--server`, `--sender`: Protocol 31 server execution over standard I/O streams with multiplexed framing.
+- `-s, --protect-args, --secluded-args`: Protect remote arguments from shell expansion via null-delimited stream.
+- `--old-args`: Pass remote arguments unquoted.
+- `--rsync-path=PROGRAM`: Specify the remote rsync executable.
+- `--max-alloc=SIZE`: Set maximum memory allocation limit (`0` for unlimited).
+- `-z, --compress`: Compressed transfer flag parsing.
+- `--info=help`, `--debug=help`: Structured diagnostic help output matching upstream rsync.
 - `-a, --archive`: Archive mode (equivalent to `-rlptgoD`).
 - `-r, --recursive`: Recurse into directories.
 - `-l, --links`: Copy symlinks as symlinks.

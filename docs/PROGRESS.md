@@ -35,11 +35,14 @@ This document tracks implementation status across phases, records upstream test 
   - [x] Implement hardlink preservation (`-H, --hard-links`) and alternate basis trees (`--link-dest`, `--copy-dest`, `--compare-dest`).
   - [x] Implement itemize changes (`-i, -ii, --itemize-changes`) with exact 11-character formatting, and `--stats`.
   - [x] Pass target upstream tests: `exclude`, `cvs-exclude`, `delete`, `delete-deep`, `delay-updates`, `backup`, `backup-deep`, `backup-dir-relative`, `hardlinks-deep`, `itemize`, `alt-dest-deep`, `temp-dir`.
-- [ ] **Phase 4: Remote Shell Execution & Wire Protocol 31**
-  - [ ] Implement multiplexed framing (`MPLEX_BASE`) and varint encoding in `ssync-proto`.
-  - [ ] Implement flist wire serialization.
-  - [ ] Implement `--server` / `--sender` mode dispatcher.
-  - [ ] Verify two-way interoperability over SSH/pipe against upstream rsync binary.
+- [x] **Phase 4: Remote Shell Execution & Wire Protocol 31**
+  - [x] Implement multiplexed framing (`MPLEX_BASE`), message codes, and varint/varlong encoding in `ssync-proto`.
+  - [x] Implement protocol 31 handshake and compatibility exchange (`CF_SAFE_FLIST`, `CF_CHKSUM_SEED_FIX`).
+  - [x] Implement flist wire serialization with prefix compression and metadata encoding.
+  - [x] Implement block checksum and delta token streaming over the wire channel.
+  - [x] Implement client remote shell execution (`[user@]host:path`, `$RSYNC_RSH`, `safe_arg` remote quoting, secluded args `-s`).
+  - [x] Implement `--server` / `--sender` mode dispatcher over multiplexed stdio.
+  - [x] Verify interoperability over SSH/pipe (`lsh.sh`) against upstream rsync binary and passing upstream test suite.
 - [ ] **Phase 5: Performance Optimization, Hardening & Security Audit**
   - [ ] SIMD acceleration for rolling checksum.
   - [ ] TOCTOU symlink race hardening.
@@ -87,7 +90,12 @@ This document tracks implementation status across phases, records upstream test 
 | `itemize` | Required | **Passed** | Phase 3 | Itemized changes output (`-i`, `-ii`) and verbose formatting |
 | `alt-dest-deep` | Required | **Passed** | Phase 3 | `--link-dest`, `--copy-dest`, `--compare-dest` at depth |
 | `temp-dir` | Required | **Passed** | Phase 3 | Cross-directory staging and missing temp dir failure |
-| `00-hello` | Deferred | Pending | Phase 4 | Remote server smoke test |
+| `00-hello` | Deferred | **Passed** | Phase 4 | Remote server smoke test, info/debug help, secluded args |
+| `ssh-basic` | Deferred | **Passed** | Phase 4 | Basic remote shell transfer and renamed file transfer with `--delete` |
+| `alt-dest` | Deferred | **Passed** | Phase 4 | Alternate destination trees (`--compare-dest`, `--copy-dest`, `--link-dest`) locally and over `lsh.sh` |
+| `max-alloc-zero` | Deferred | **Passed** | Phase 4 | Verbatim forwarding of `--max-alloc=0` across remote shell |
+| `remote-shell-newline-escaping` | Deferred | **Passed** | Phase 4 | Remote shell argument quoting and newline escaping |
+| `scanner-argv-bounds` | Deferred | **Passed** | Phase 4 | Robust argument scanner bounds against buffer overflows and option floods |
 
 *(Full mapping of all 374 upstream tests is maintained in `docs/TESTSUITE_MAP.md`)*
 
@@ -95,6 +103,8 @@ This document tracks implementation status across phases, records upstream test 
 
 ## 3. Backlog
 
+- [ ] Support `--files-from=FILE` for reading transfer paths from list files.
+- [ ] Wire-streamed filter rules exchange (`exclude-lsh`) and remote hardlink table exchange (`hardlinks`).
 - [ ] Investigate `fallocate` / `posix_fallocate` support on Linux for preallocating destination files.
 - [ ] Benchmark AVX2 / NEON vectorization for `get_checksum1` rolling updates.
 - [ ] Consider adding a `--json` output flag (in addition to standard rsync output) for machine readability.
@@ -102,19 +112,17 @@ This document tracks implementation status across phases, records upstream test 
 
 ---
 
-## 4. Notes for Next Session (Phase 4: Remote Shell Execution & Wire Protocol 31)
+## 4. Notes for Next Session (Phase 5: Performance Optimization, Hardening & Security Audit)
 
-1. **Immediate Focus**: Implement Phase 4: Remote Shell Execution & Wire Protocol 31.
+1. **Immediate Focus**: Phase 5: Performance Optimization, Hardening & Security Audit.
 2. **Key Components to Implement**:
-   - `crates/ssync-proto`:
-     - Protocol 31 wire handshake and compatibility bitflags (`CF_INC_RECURSE`, `CF_SYMLINK_TIMES`, `CF_SAFE_FLIST`, `CF_VARINT_FLIST_FLAGS`).
-     - Multiplexed channel framing (`MPLEX_BASE = 7`, `MSG_DATA`, `MSG_INFO`, `MSG_ERROR_XFER`, etc.).
-     - Variable-length integer encoding and decoding (`varint`, `varlong`).
-     - File list (`flist`) wire serialization with prefix compression and metadata encoding.
-   - `crates/ssync-cli`:
-     - Server command dispatcher (`--server`, `--sender`).
-     - Remote shell launcher (`ssh`, `-e, --rsh`, or `support/lsh.sh`).
-     - Two-way pipe/socket transport loop between local generator/receiver and remote server.
+   - `crates/ssync-core`:
+     - SIMD rolling checksum acceleration (`std::simd` or explicit AVX2 / NEON vectorization).
+     - Benchmarks comparing rolling checksum and delta generation throughput.
+   - `crates/ssync-fs`:
+     - Hardening against symlink races and TOCTOU directory traversal (`O_NOFOLLOW`, `RESOLVE_BENEATH` / `openat2`).
+     - Safe relative traversal invariants.
+   - Comprehensive differential testing against reference rsync using `testsuite/abdiff.py`.
 3. **Verification**:
-   - Unit and integration tests for multiplexing, varint wire encoding, and flist serialization.
-   - Run upstream testsuite targets for Phase 4: `00-hello`, `alt-dest`, `ssh-basic`, `hardlinks`.
+   - `cargo bench` throughput metrics.
+   - Run upstream testsuite and differential test sweeps.

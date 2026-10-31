@@ -205,7 +205,7 @@ Total upstream test files analyzed: **374**
 | 150 | `files-from-depth` | Required | Phase 1 | Local sync behavior | Coverage of --files-from, -0/--from0, --exclude-from, --include-from at depth. |
 | 151 | `files-from-leak` | Out of scope | N/A | Daemon / rsyncd.conf / multi-tenant server out of scope for v1 | Verify `--files-from` does not leak file contents or follow untrusted symlinks outside the allowed tree. |
 | 152 | `files-from-path-clamp` | Required | Phase 1 | Local sync behavior | Verify `--files-from` clamps/rejects traversal paths (`..`) so remote/daemon sender stays within root. |
-| 153 | `files-from` | Deferred | Phase 4 | Remote shell / server protocol compatibility | Verify that --files-from=LIST drives rsync correctly both for a plain local sync and across the lsh.sh "remote shell" with each of the... |
+| 153 | `files-from` | Deferred | Backlog | `--files-from` list reading and remote host resolution | Verify that --files-from=LIST drives rsync correctly both for a plain local sync and across the lsh.sh "remote shell" with each of the... |
 | 154 | `filter-depth` | Required | Phase 3 | Filter, include/exclude, and wildmatch rules | Coverage of --exclude / --include / --filter / -F at depth. |
 | 155 | `filter-leak` | Out of scope | N/A | Daemon / rsyncd.conf / multi-tenant server out of scope for v1 | Verify per-directory merge filter files (`--filter=dir-merge`) do not follow symlinks to read outside files. |
 | 156 | `filter-merge-content-echo` | Required | Phase 3 | Filter, include/exclude, and wildmatch rules | A merge file's contents must not come back in a filter syntax error. |

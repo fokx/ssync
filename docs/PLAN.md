@@ -132,7 +132,7 @@ Phase 5: Performance Optimization, Hardening & Security Audit
   - `ssync` client successfully synchronizes against `rsync --server` over SSH/pipe.
   - `rsync` client successfully synchronizes against `ssync --server` over SSH/pipe.
 - **Target Upstream Tests**:
-  - `00-hello`, `alt-dest`, `files-from`, `max-alloc-zero`.
+  - `00-hello`, `ssh-basic`, `alt-dest`, `max-alloc-zero`, `remote-shell-newline-escaping`, `scanner-argv-bounds`.
   - Upstream tests exercising `lsh.sh`.
 - **Risks**:
   - Deadlocks in multiplexed full-duplex pipe I/O if channel buffers fill without being drained.

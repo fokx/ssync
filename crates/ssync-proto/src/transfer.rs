@@ -24,7 +24,12 @@ pub fn send_block_checksums<W: Write>(
 
     for sum in sums {
         write_int(writer, sum.sum1 as i32)?;
-        writer.write_all(&sum.sum2)?;
+        let s2 = if sum.sum2.len() >= sum_struct.strong_sum_len {
+            &sum.sum2[..sum_struct.strong_sum_len]
+        } else {
+            &sum.sum2
+        };
+        writer.write_all(s2)?;
     }
 
     writer.flush()?;
