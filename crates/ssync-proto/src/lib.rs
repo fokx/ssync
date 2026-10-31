@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod flist;
+pub mod handshake;
 pub mod mplex;
+pub mod transfer;
 pub mod varint;
 
 #[derive(Debug, thiserror::Error)]

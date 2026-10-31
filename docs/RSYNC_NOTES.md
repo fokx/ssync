@@ -88,9 +88,25 @@ Rsync operates across three primary processes, configured depending on the trans
 - **`varint` (up to 32-bit integer)**:
   - Compact prefix encoding where the first byte determines the extra bytes needed.
   - Extra count table `int_byte_extra[64]` based on top bits of first byte (`ch / 4`).
+    - Values 0..31: 0 extra bytes (1 byte total, values 0..127).
+    - Values 32..47: 1 extra byte (2 bytes total, bit mask `0x7f`).
+    - Values 48..55: 2 extra bytes (3 bytes total, bit mask `0x3f`).
+    - Values 56..59: 3 extra bytes (4 bytes total, bit mask `0x1f`).
+    - Values 60..61: 4 extra bytes (5 bytes total, bit mask `0x0f`).
   - Small positive values (0 to 127) fit in 1 byte; larger values take 2, 3, 4, or 5 bytes.
 - **`varlong` (64-bit integer / file offsets)**:
   - Takes `min_bytes` (e.g. 3 or 4) to optimize transmission of typical file sizes or timestamps.
+  - Trailing zeroes beyond `min_bytes` are stripped; tag byte encodes length using same bit prefix logic.
+
+### Protected Arguments & Remote Quoting
+- Upstream Files: `options.c` (`safe_arg`, `server_options`), `main.c` (`do_cmd`, `send_protected_args`, `read_args`).
+- In non-protected mode:
+  - Shell special characters (`!#$&;|<>(){}"'\` \t\n\r\`) are escaped with `\` unless wildcards are permitted.
+  - When `--old-args` (or `RSYNC_OLD_ARGS=1`) is set, unquoted arguments are passed directly for remote shell re-splitting.
+- In protected mode (`-s`, `--protect-args`, `--secluded-args`):
+  - Remote command line stops before the directory and file arguments: `rsync --server [--sender] [options]`.
+  - The client then streams each protected argument over stdin as a null-terminated byte string (`arg\0`), terminated by an extra empty string (`\0`).
+  - The server reads these arguments directly from stdin, completely bypassing remote shell expansion.
 
 ---
 
