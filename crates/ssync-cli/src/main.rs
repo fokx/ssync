@@ -777,6 +777,9 @@ fn main() {
                 eprintln!("ssync: {}", e);
                 process::exit(25);
             }
+            FsError::PartialTransfer => {
+                process::exit(23);
+            }
             _ => {
                 eprintln!("ssync: transfer error: {}", e);
                 process::exit(11);

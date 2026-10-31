@@ -3,6 +3,7 @@
 use crate::FsError;
 use crate::filter::FilterSet;
 use crate::metadata::{FileMetadata, FileType};
+use crate::secure::{safe_create_dir_all, safe_rename_into};
 use crate::walker::TransferEntry;
 use ssync_core::checksum::{ChecksumAlgorithm, calculate_file_checksum};
 use ssync_core::delta::{
@@ -252,6 +253,7 @@ impl SyncEngine {
         let mut delayed_staging_dirs: HashSet<PathBuf> = HashSet::new();
         let mut transferred_names: Vec<String> = Vec::new();
         let mut total_stats = MatchStats::default();
+        let mut had_partial_error = false;
 
         for entry in entries {
             let dest_path = if entry.relative_dest_path.as_os_str().is_empty() {
@@ -264,34 +266,31 @@ impl SyncEngine {
                 continue;
             }
 
-            match entry.metadata.file_type {
-                FileType::Directory => {
-                    self.sync_directory(
-                        entry,
-                        &dest_path,
-                        dest_root,
-                        dest_existed,
-                        &mut dirs_to_update,
-                    )?;
-                }
-                FileType::Symlink => {
-                    self.sync_symlink(entry, &dest_path, dest_root)?;
-                }
-                FileType::Regular => {
-                    self.sync_regular_file(
-                        entry,
-                        &dest_path,
-                        dest_root,
-                        &mut hardlink_map,
-                        &mut delayed_updates,
-                        &mut delayed_staging_dirs,
-                        &mut transferred_names,
-                        &mut total_stats,
-                    )?;
-                }
-                _ => {
-                    self.sync_special(entry, &dest_path)?;
-                }
+            let res = match entry.metadata.file_type {
+                FileType::Directory => self.sync_directory(
+                    entry,
+                    &dest_path,
+                    dest_root,
+                    dest_existed,
+                    &mut dirs_to_update,
+                ),
+                FileType::Symlink => self.sync_symlink(entry, &dest_path, dest_root),
+                FileType::Regular => self.sync_regular_file(
+                    entry,
+                    &dest_path,
+                    dest_root,
+                    &mut hardlink_map,
+                    &mut delayed_updates,
+                    &mut delayed_staging_dirs,
+                    &mut transferred_names,
+                    &mut total_stats,
+                ),
+                _ => self.sync_special(entry, &dest_path, dest_root),
+            };
+
+            if let Err(e) = res {
+                eprintln!("ssync: {}: {}", dest_path.display(), e);
+                had_partial_error = true;
             }
         }
 
@@ -308,9 +307,9 @@ impl SyncEngine {
         if !delayed_updates.is_empty() && !self.options.dry_run {
             for (staged_path, final_dest) in &delayed_updates {
                 if let Some(parent) = final_dest.parent() {
-                    let _ = fs::create_dir_all(parent);
+                    let _ = safe_create_dir_all(dest_root, parent);
                 }
-                fs::rename(staged_path, final_dest)?;
+                safe_rename_into(dest_root, staged_path, final_dest)?;
             }
             for staging_dir in &delayed_staging_dirs {
                 let _ = fs::remove_dir(staging_dir);
@@ -349,6 +348,10 @@ impl SyncEngine {
             println!("Matched data: {} bytes", total_stats.matched_bytes);
         }
 
+        if had_partial_error {
+            return Err(FsError::PartialTransfer);
+        }
+
         Ok(())
     }
 
@@ -371,7 +374,7 @@ impl SyncEngine {
             self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
         {
             if !self.options.dry_run && !dest_path.exists() {
-                fs::create_dir_all(dest_path)?;
+                safe_create_dir_all(dest_root, dest_path)?;
             }
             if self.options.itemize_changes && !self.options.quiet {
                 if self.options.verbose > 1 {
@@ -402,7 +405,7 @@ impl SyncEngine {
         };
 
         if !self.options.dry_run && !dest_path.exists() {
-            fs::create_dir_all(dest_path)?;
+            safe_create_dir_all(dest_root, dest_path)?;
         }
 
         if self.options.itemize_changes && !self.options.quiet {
@@ -473,7 +476,7 @@ impl SyncEngine {
 
             if !is_compare && !self.options.dry_run {
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    safe_create_dir_all(dest_root, parent)?;
                 }
                 if dest_path.symlink_metadata().is_ok() {
                     let _ = fs::remove_file(dest_path);
@@ -516,7 +519,7 @@ impl SyncEngine {
         if !target_matches {
             if !self.options.dry_run {
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    safe_create_dir_all(dest_root, parent)?;
                 }
 
                 if dest_path.symlink_metadata().is_ok() {
@@ -622,7 +625,7 @@ impl SyncEngine {
         };
 
         if let Some(parent) = backup_dest.parent() {
-            let _ = fs::create_dir_all(parent);
+            let _ = safe_create_dir_all(dest_root, parent);
         }
 
         if backup_dest.exists() {
@@ -680,7 +683,7 @@ impl SyncEngine {
     ) -> Result<(), FsError> {
         if !self.options.dry_run {
             if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
+                safe_create_dir_all(dest_root, parent)?;
             }
         }
 
@@ -763,7 +766,7 @@ impl SyncEngine {
 
             if !is_compare && !self.options.dry_run {
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    safe_create_dir_all(dest_root, parent)?;
                 }
                 if dest_path.symlink_metadata().is_ok() {
                     let _ = fs::remove_file(dest_path);
@@ -973,12 +976,13 @@ impl SyncEngine {
                     self.perform_delay_updates_transfer(
                         entry,
                         dest_path,
+                        dest_root,
                         delayed_updates,
                         delayed_staging_dirs,
                         total_stats,
                     )?;
                 } else {
-                    self.perform_staged_transfer(entry, dest_path, total_stats)?;
+                    self.perform_staged_transfer(entry, dest_path, dest_root, total_stats)?;
                 }
 
                 if !self.options.delay_updates {
@@ -1159,6 +1163,7 @@ impl SyncEngine {
         &self,
         entry: &TransferEntry,
         dest_path: &Path,
+        dest_root: &Path,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         let rand_id = std::time::SystemTime::now()
@@ -1209,17 +1214,19 @@ impl SyncEngine {
             }
         }
 
-        if let Err(e) = fs::rename(&tmp_path, dest_path) {
-            if e.raw_os_error() == Some(libc::EXDEV)
-                || e.kind() == std::io::ErrorKind::CrossesDevices
-            {
-                let res = fs::copy(&tmp_path, dest_path);
-                let _ = fs::remove_file(&tmp_path);
-                res?;
-            } else {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(FsError::Io(e));
+        if let Err(e) = safe_rename_into(dest_root, &tmp_path, dest_path) {
+            if let FsError::Io(ref io_err) = e {
+                if io_err.raw_os_error() == Some(libc::EXDEV)
+                    || io_err.kind() == std::io::ErrorKind::CrossesDevices
+                {
+                    let res = fs::copy(&tmp_path, dest_path);
+                    let _ = fs::remove_file(&tmp_path);
+                    res?;
+                    return Ok(());
+                }
             }
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
         }
         Ok(())
     }
@@ -1228,13 +1235,14 @@ impl SyncEngine {
         &self,
         entry: &TransferEntry,
         dest_path: &Path,
+        dest_root: &Path,
         delayed_updates: &mut Vec<(PathBuf, PathBuf)>,
         delayed_staging_dirs: &mut HashSet<PathBuf>,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
         let staging_dir = parent.join(".~tmp~");
-        let _ = fs::create_dir_all(&staging_dir);
+        let _ = safe_create_dir_all(dest_root, &staging_dir);
         delayed_staging_dirs.insert(staging_dir.clone());
 
         let file_name = dest_path.file_name().unwrap();
@@ -1247,10 +1255,15 @@ impl SyncEngine {
         Ok(())
     }
 
-    fn sync_special(&self, entry: &TransferEntry, dest_path: &Path) -> Result<(), FsError> {
+    fn sync_special(
+        &self,
+        entry: &TransferEntry,
+        dest_path: &Path,
+        dest_root: &Path,
+    ) -> Result<(), FsError> {
         if !self.options.dry_run {
             if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
+                safe_create_dir_all(dest_root, parent)?;
             }
             if dest_path.symlink_metadata().is_ok() {
                 let _ = fs::remove_file(dest_path);

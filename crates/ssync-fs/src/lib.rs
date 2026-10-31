@@ -3,6 +3,7 @@
 pub mod filter;
 pub mod metadata;
 pub mod path;
+pub mod secure;
 pub mod sync;
 pub mod walker;
 
@@ -16,4 +17,6 @@ pub enum FsError {
     MetadataError(String),
     #[error("Deletion limit exceeded: {0}")]
     DeleteLimitReached(usize),
+    #[error("Some files/attrs were not transferred")]
+    PartialTransfer,
 }
