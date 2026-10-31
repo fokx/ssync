@@ -14,3 +14,7 @@ sha1.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[[bench]]
+name = "checksum_bench"
+harness = false

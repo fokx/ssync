@@ -32,18 +32,50 @@ impl RollingChecksum {
     pub fn calculate(buf: &[u8]) -> Self {
         let mut s1: u32 = 0;
         let mut s2: u32 = 0;
-        let len = buf.len();
+        let mut offset = 0;
 
-        for (i, &byte) in buf.iter().enumerate() {
-            let b = byte as u32;
-            s1 = s1.wrapping_add(b);
-            s2 = s2.wrapping_add((len - i) as u32 * b);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && buf.len() >= 32 {
+                // SAFETY: We checked that the CPU supports AVX2 via runtime CPUID detection,
+                // and calculate_avx2 accesses only in-bounds 32-byte chunks of buf.
+                let (consumed, s1_acc, s2_acc) = unsafe { calculate_avx2(buf, s1, s2) };
+                offset = consumed;
+                s1 = s1_acc;
+                s2 = s2_acc;
+            }
+        }
+
+        // Unrolled 4-byte chunk loop for remainder or when SIMD is unavailable.
+        let rem = &buf[offset..];
+        let chunks_4 = rem.len() / 4;
+        for i in 0..chunks_4 {
+            let base = i * 4;
+            let b0 = rem[base] as u32;
+            let b1 = rem[base + 1] as u32;
+            let b2 = rem[base + 2] as u32;
+            let b3 = rem[base + 3] as u32;
+
+            s2 = s2
+                .wrapping_add(4u32.wrapping_mul(s1))
+                .wrapping_add(4u32.wrapping_mul(b0))
+                .wrapping_add(3u32.wrapping_mul(b1))
+                .wrapping_add(2u32.wrapping_mul(b2))
+                .wrapping_add(b3);
+            s1 = s1.wrapping_add(b0 + b1 + b2 + b3);
+        }
+
+        let tail = &rem[chunks_4 * 4..];
+        for &b in tail {
+            let val = b as u32;
+            s1 = s1.wrapping_add(val);
+            s2 = s2.wrapping_add(s1);
         }
 
         Self {
             s1: s1 & 0xFFFF,
             s2: s2 & 0xFFFF,
-            count: len,
+            count: buf.len(),
         }
     }
 
@@ -218,9 +250,97 @@ pub fn calculate_file_checksum(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+/// # Safety
+/// The caller must ensure that the target CPU supports AVX2, and `buf` is a valid slice.
+unsafe fn calculate_avx2(buf: &[u8], mut s1: u32, mut s2: u32) -> (usize, u32, u32) {
+    use std::arch::x86_64::*;
+
+    // SAFETY: Intrinsics calls are valid under target_feature(enable = "avx2").
+    unsafe {
+        let ones_8 = _mm256_set1_epi8(1);
+        let ones_16 = _mm256_set1_epi16(1);
+        #[rustfmt::skip]
+        let weights = _mm256_setr_epi8(
+            32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+            16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+        );
+
+        let chunks = buf.len() / 32;
+        let ptr = buf.as_ptr();
+
+        for i in 0..chunks {
+            // SAFETY: i * 32 + 32 <= buf.len(), so ptr.add(i * 32) points to 32 readable bytes.
+            let v = _mm256_loadu_si256(ptr.add(i * 32) as *const __m256i);
+
+            // T1 = sum(b_j)
+            let pairs_t1 = _mm256_maddubs_epi16(v, ones_8);
+            let quads_t1 = _mm256_madd_epi16(pairs_t1, ones_16);
+
+            // T2 = sum((32 - j) * b_j)
+            let pairs_t2 = _mm256_maddubs_epi16(v, weights);
+            let quads_t2 = _mm256_madd_epi16(pairs_t2, ones_16);
+
+            // Horizontal sum of quads_t1
+            let lo_t1 = _mm256_castsi256_si128(quads_t1);
+            let hi_t1 = _mm256_extracti128_si256(quads_t1, 1);
+            let sum_t1_128 = _mm_add_epi32(lo_t1, hi_t1);
+            let sum_t1_64 = _mm_add_epi32(sum_t1_128, _mm_shuffle_epi32(sum_t1_128, 0xEE));
+            let sum_t1_32 = _mm_add_epi32(sum_t1_64, _mm_shuffle_epi32(sum_t1_64, 0x55));
+            let t1 = _mm_cvtsi128_si32(sum_t1_32) as u32;
+
+            // Horizontal sum of quads_t2
+            let lo_t2 = _mm256_castsi256_si128(quads_t2);
+            let hi_t2 = _mm256_extracti128_si256(quads_t2, 1);
+            let sum_t2_128 = _mm_add_epi32(lo_t2, hi_t2);
+            let sum_t2_64 = _mm_add_epi32(sum_t2_128, _mm_shuffle_epi32(sum_t2_128, 0xEE));
+            let sum_t2_32 = _mm_add_epi32(sum_t2_64, _mm_shuffle_epi32(sum_t2_64, 0x55));
+            let t2 = _mm_cvtsi128_si32(sum_t2_32) as u32;
+
+            s2 = s2.wrapping_add(32u32.wrapping_mul(s1)).wrapping_add(t2);
+            s1 = s1.wrapping_add(t1);
+        }
+
+        (chunks * 32, s1, s2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn scalar_reference(buf: &[u8]) -> (u16, u16) {
+        let mut s1: u32 = 0;
+        let mut s2: u32 = 0;
+        let len = buf.len();
+        for (i, &byte) in buf.iter().enumerate() {
+            let b = byte as u32;
+            s1 = s1.wrapping_add(b);
+            s2 = s2.wrapping_add((len - i) as u32 * b);
+        }
+        ((s1 & 0xFFFF) as u16, (s2 & 0xFFFF) as u16)
+    }
+
+    proptest! {
+        #[test]
+        fn test_simd_matches_scalar_reference(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            let (ref_s1, ref_s2) = scalar_reference(&data);
+            let cs = RollingChecksum::calculate(&data);
+            prop_assert_eq!(cs.s1(), ref_s1);
+            prop_assert_eq!(cs.s2(), ref_s2);
+        }
+
+        #[test]
+        fn test_simd_unaligned_slices(data in proptest::collection::vec(any::<u8>(), 33..256), offset in 1usize..16) {
+            let slice = &data[offset..];
+            let (ref_s1, ref_s2) = scalar_reference(slice);
+            let cs = RollingChecksum::calculate(slice);
+            prop_assert_eq!(cs.s1(), ref_s1);
+            prop_assert_eq!(cs.s2(), ref_s2);
+        }
+    }
 
     #[test]
     fn test_rolling_checksum_matches_full_calc() {

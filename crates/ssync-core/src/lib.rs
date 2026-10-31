@@ -1,7 +1,5 @@
 //! ssync-core: Core algorithms, checksums, and delta-transfer math for ssync.
 
-#![forbid(unsafe_code)]
-
 pub mod checksum;
 pub mod delta;
 
