@@ -319,6 +319,30 @@ struct Cli {
     #[arg(short = 'W', long = "whole-file")]
     whole_file: bool,
 
+    /// Turn on sparse file handling
+    #[arg(short = 'S', long = "sparse")]
+    sparse: bool,
+
+    /// Don't map uid/gid values by user/group name
+    #[arg(long = "numeric-ids")]
+    numeric_ids: bool,
+
+    /// Choose checksum algorithm
+    #[arg(long = "checksum-choice")]
+    checksum_choice: Option<String>,
+
+    /// Choose compression algorithm
+    #[arg(long = "compress-choice")]
+    compress_choice: Option<String>,
+
+    /// Disable incremental recursion
+    #[arg(long = "no-inc-recursive")]
+    no_inc_recursive: bool,
+
+    /// Store/recover privileged attributes using xattrs
+    #[arg(long = "fake-super")]
+    fake_super: bool,
+
     /// Run as a remote server
     #[arg(long = "server")]
     server: bool,
@@ -524,6 +548,59 @@ fn main() {
         }
     }
 
+    // Set up filter rules
+    let mut filters = FilterSet::new();
+
+    if cli.filter_cvs >= 2 {
+        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
+        filters.add_cvs_excludes();
+    } else if cli.filter_cvs == 1 {
+        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
+    }
+
+    if cli.cvs_exclude {
+        filters.add_cvs_excludes();
+    }
+
+    for arg in &cli.filter {
+        if let Err(e) = filters.add_filter_arg(arg) {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        }
+    }
+
+    for inc_file in &cli.include_from {
+        if inc_file == "-" {
+            if let Err(e) = filters.load_stdin(RuleAction::Include) {
+                eprintln!("ssync: failed reading include from stdin: {}", e);
+                process::exit(1);
+            }
+        } else if let Err(e) = filters.load_file(Path::new(inc_file), RuleAction::Include) {
+            eprintln!("ssync: failed opening include file: {}", e);
+            process::exit(1);
+        }
+    }
+
+    for inc in &cli.include {
+        filters.add_include(inc);
+    }
+
+    for exc_file in &cli.exclude_from {
+        if exc_file == "-" {
+            if let Err(e) = filters.load_stdin(RuleAction::Exclude) {
+                eprintln!("ssync: failed reading exclude from stdin: {}", e);
+                process::exit(1);
+            }
+        } else if let Err(e) = filters.load_file(Path::new(exc_file), RuleAction::Exclude) {
+            eprintln!("ssync: failed opening exclude file: {}", e);
+            process::exit(1);
+        }
+    }
+
+    for exc in &cli.exclude {
+        filters.add_exclude(exc);
+    }
+
     if cli.server {
         if let Err(e) = wire::run_wire_server(
             cli.sender,
@@ -596,59 +673,6 @@ fn main() {
         }
     }
 
-    // Set up filter rules
-    let mut filters = FilterSet::new();
-
-    if cli.filter_cvs >= 2 {
-        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
-        filters.add_cvs_excludes();
-    } else if cli.filter_cvs == 1 {
-        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
-    }
-
-    if cli.cvs_exclude {
-        filters.add_cvs_excludes();
-    }
-
-    for arg in &cli.filter {
-        if let Err(e) = filters.add_filter_arg(arg) {
-            eprintln!("ssync: {}", e);
-            process::exit(1);
-        }
-    }
-
-    for inc_file in &cli.include_from {
-        if inc_file == "-" {
-            if let Err(e) = filters.load_stdin(RuleAction::Include) {
-                eprintln!("ssync: failed reading include from stdin: {}", e);
-                process::exit(1);
-            }
-        } else if let Err(e) = filters.load_file(Path::new(inc_file), RuleAction::Include) {
-            eprintln!("ssync: failed opening include file: {}", e);
-            process::exit(1);
-        }
-    }
-
-    for inc in &cli.include {
-        filters.add_include(inc);
-    }
-
-    for exc_file in &cli.exclude_from {
-        if exc_file == "-" {
-            if let Err(e) = filters.load_stdin(RuleAction::Exclude) {
-                eprintln!("ssync: failed reading exclude from stdin: {}", e);
-                process::exit(1);
-            }
-        } else if let Err(e) = filters.load_file(Path::new(exc_file), RuleAction::Exclude) {
-            eprintln!("ssync: failed opening exclude file: {}", e);
-            process::exit(1);
-        }
-    }
-
-    for exc in &cli.exclude {
-        filters.add_exclude(exc);
-    }
-
     let recursive = cli.recursive || cli.archive;
     let links = cli.links || cli.archive;
     let perms = cli.perms || cli.archive;
@@ -689,6 +713,7 @@ fn main() {
         max_size,
         min_size,
         prune_empty_dirs: cli.prune_empty_dirs,
+        verbose: cli.verbose,
     };
 
     let walker = Walker::new(walk_opts);
@@ -699,6 +724,7 @@ fn main() {
             process::exit(11);
         }
     };
+    let scan_had_error = walker.had_error();
 
     if let Some(ref tdir) = cli.temp_dir {
         let p = Path::new(tdir);
@@ -767,6 +793,11 @@ fn main() {
         copy_dest,
         compare_dest,
         dest_is_file,
+        relative: cli.relative,
+        sparse: cli.sparse,
+        copy_links: cli.copy_links,
+        copy_dirlinks: cli.copy_dirlinks,
+        copy_unsafe_links: cli.copy_unsafe_links,
         filters,
     };
 
@@ -778,6 +809,9 @@ fn main() {
                 process::exit(25);
             }
             FsError::PartialTransfer => {
+                eprintln!(
+                    "rsync error: some files/attrs were not transferred (see previous errors) (code 23)"
+                );
                 process::exit(23);
             }
             _ => {
@@ -785,5 +819,12 @@ fn main() {
                 process::exit(11);
             }
         }
+    }
+
+    if scan_had_error {
+        eprintln!(
+            "rsync error: some files/attrs were not transferred (see previous errors) (code 23)"
+        );
+        process::exit(23);
     }
 }

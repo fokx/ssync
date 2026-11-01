@@ -25,12 +25,14 @@ pub struct WalkOptions {
     pub max_size: Option<u64>,
     pub min_size: Option<u64>,
     pub prune_empty_dirs: bool,
+    pub verbose: u8,
 }
 
 /// Represents an item scheduled for transfer.
 #[derive(Debug, Clone)]
 pub struct TransferEntry {
     pub source_path: PathBuf,
+    pub source_root: Option<PathBuf>,
     pub relative_dest_path: PathBuf,
     pub metadata: FileMetadata,
     pub is_implied_dir: bool,
@@ -38,11 +40,19 @@ pub struct TransferEntry {
 
 pub struct Walker {
     options: WalkOptions,
+    had_error: std::sync::atomic::AtomicBool,
 }
 
 impl Walker {
     pub fn new(options: WalkOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            had_error: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn had_error(&self) -> bool {
+        self.had_error.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Scans a list of source paths and generates a list of transfer entries.
@@ -85,6 +95,23 @@ impl Walker {
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
         let mut filters = self.options.filters.clone();
+        let source_root = if self.options.relative {
+            if let Some(idx) = source.raw.find("/./") {
+                PathBuf::from(&source.raw[..idx])
+            } else if source.path.is_absolute() {
+                PathBuf::from("/")
+            } else {
+                PathBuf::from(".")
+            }
+        } else if source.has_trailing_slash {
+            source.path.clone()
+        } else {
+            source
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
 
         if self.options.relative {
             // Check if there is an explicit anchor (starts with "./" or contains "/./")
@@ -93,6 +120,7 @@ impl Walker {
                     if let Ok(meta) = self.read_meta(&anc) {
                         entries.push(TransferEntry {
                             source_path: anc,
+                            source_root: Some(source_root.clone()),
                             relative_dest_path: PathBuf::from(""),
                             metadata: meta,
                             is_implied_dir: false,
@@ -101,31 +129,18 @@ impl Walker {
                 }
             }
 
-            // 1. Handle implied parent directories for -R
-            let ancestors = source.implied_ancestors();
-            for anc in ancestors {
-                if seen_dest_paths.insert(anc.clone()) {
-                    let meta = if self.options.no_implied_dirs {
-                        // Default attributes for implied dirs (0o755)
-                        FileMetadata {
-                            file_type: FileType::Directory,
-                            mode: 0o755,
-                            size: 0,
-                            mtime_sec: 0,
-                            mtime_nsec: 0,
-                            atime_sec: 0,
-                            atime_nsec: 0,
-                            uid: 0,
-                            gid: 0,
-                            dev: 0,
-                            ino: 0,
-                            nlink: 1,
-                            symlink_target: None,
-                        }
-                    } else {
-                        // Inherit from source ancestor if it exists, else default
-                        if anc.exists() {
-                            FileMetadata::from_path(&anc, false)?
+            // 1. Handle implied parent directories for -R (unless --no-implied-dirs)
+            if !self.options.no_implied_dirs {
+                let ancestors = source.implied_ancestors();
+                for anc in ancestors {
+                    if seen_dest_paths.insert(anc.clone()) {
+                        let real_anc = if source.path.is_absolute() && !source.raw.contains("/./") {
+                            Path::new("/").join(&anc)
+                        } else {
+                            anc.clone()
+                        };
+                        let meta = if real_anc.exists() {
+                            FileMetadata::from_path(&real_anc, false)?
                         } else {
                             FileMetadata {
                                 file_type: FileType::Directory,
@@ -142,15 +157,16 @@ impl Walker {
                                 nlink: 1,
                                 symlink_target: None,
                             }
-                        }
-                    };
+                        };
 
-                    entries.push(TransferEntry {
-                        source_path: anc.clone(),
-                        relative_dest_path: anc,
-                        metadata: meta,
-                        is_implied_dir: true,
-                    });
+                        entries.push(TransferEntry {
+                            source_path: real_anc,
+                            source_root: Some(source_root.clone()),
+                            relative_dest_path: anc,
+                            metadata: meta,
+                            is_implied_dir: true,
+                        });
+                    }
                 }
             }
 
@@ -158,6 +174,7 @@ impl Walker {
             let rel_base = source.relative_cut_path();
             self.scan_path(
                 &source.path,
+                Some(&source_root),
                 &rel_base,
                 &mut filters,
                 entries,
@@ -165,7 +182,11 @@ impl Walker {
             )?;
         } else {
             // Non-relative traversal
-            let meta = self.read_meta(&source.path)?;
+            let meta = match self.read_meta(&source.path) {
+                Ok(m) => m,
+                Err(FsError::PartialTransfer) => return Ok(()),
+                Err(e) => return Err(e),
+            };
             if meta.file_type == FileType::Directory {
                 if source.has_trailing_slash {
                     // Contents transferred directly under destination root.
@@ -173,6 +194,7 @@ impl Walker {
                     if seen_dest_paths.insert(PathBuf::from("")) {
                         entries.push(TransferEntry {
                             source_path: source.path.clone(),
+                            source_root: Some(source_root.clone()),
                             relative_dest_path: PathBuf::from(""),
                             metadata: meta,
                             is_implied_dir: false,
@@ -180,6 +202,7 @@ impl Walker {
                     }
                     self.scan_dir_contents(
                         &source.path,
+                        Some(&source_root),
                         Path::new(""),
                         &filters,
                         entries,
@@ -194,6 +217,7 @@ impl Walker {
                     let rel_dest = PathBuf::from(dir_name);
                     self.scan_path(
                         &source.path,
+                        Some(&source_root),
                         &rel_dest,
                         &mut filters,
                         entries,
@@ -213,6 +237,7 @@ impl Walker {
                 };
                 self.scan_path(
                     &source.path,
+                    Some(&source_root),
                     &rel_dest,
                     &mut filters,
                     entries,
@@ -226,7 +251,20 @@ impl Walker {
 
     fn read_meta(&self, path: &Path) -> Result<FileMetadata, FsError> {
         if self.options.copy_links {
-            FileMetadata::from_path(path, true)
+            match FileMetadata::from_path(path, true) {
+                Ok(meta) => Ok(meta),
+                Err(e) => {
+                    if let Ok(direct) = FileMetadata::from_path(path, false) {
+                        if direct.file_type == FileType::Symlink {
+                            eprintln!("symlink has no referent: \"{}\"", path.display());
+                            self.had_error
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(FsError::PartialTransfer);
+                        }
+                    }
+                    Err(e)
+                }
+            }
         } else if self.options.copy_dirlinks {
             let direct = FileMetadata::from_path(path, false)?;
             if direct.file_type == FileType::Symlink {
@@ -273,22 +311,29 @@ impl Walker {
     fn scan_path(
         &self,
         src: &Path,
+        source_root: Option<&Path>,
         rel_dest: &Path,
         current_filters: &mut FilterSet,
         entries: &mut Vec<TransferEntry>,
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
-        let mut meta = self.read_meta(src)?;
+        let mut meta = match self.read_meta(src) {
+            Ok(m) => m,
+            Err(FsError::PartialTransfer) => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
         if meta.file_type == FileType::Symlink {
             if let Some(target) = &meta.symlink_target {
                 if Self::is_unsafe_symlink(rel_dest, target) {
                     if self.options.safe_links {
-                        println!(
-                            "ignoring unsafe symlink \"{}\" -> \"{}\"",
-                            rel_dest.display(),
-                            target.display()
-                        );
+                        if self.options.verbose > 0 {
+                            println!(
+                                "ignoring unsafe symlink \"{}\" -> \"{}\"",
+                                rel_dest.display(),
+                                target.display()
+                            );
+                        }
                         return Ok(());
                     }
                     if self.options.copy_unsafe_links {
@@ -336,6 +381,7 @@ impl Walker {
             if seen_dest_paths.insert(rel_dest.to_path_buf()) {
                 entries.push(TransferEntry {
                     source_path: src.to_path_buf(),
+                    source_root: source_root.map(Path::to_path_buf),
                     relative_dest_path: rel_dest.to_path_buf(),
                     metadata: meta,
                     is_implied_dir: false,
@@ -343,11 +389,19 @@ impl Walker {
             }
 
             if self.options.recursive {
-                self.scan_dir_contents(src, rel_dest, current_filters, entries, seen_dest_paths)?;
+                self.scan_dir_contents(
+                    src,
+                    source_root,
+                    rel_dest,
+                    current_filters,
+                    entries,
+                    seen_dest_paths,
+                )?;
             }
         } else if seen_dest_paths.insert(rel_dest.to_path_buf()) {
             entries.push(TransferEntry {
                 source_path: src.to_path_buf(),
+                source_root: source_root.map(Path::to_path_buf),
                 relative_dest_path: rel_dest.to_path_buf(),
                 metadata: meta,
                 is_implied_dir: false,
@@ -360,6 +414,7 @@ impl Walker {
     fn scan_dir_contents(
         &self,
         dir_path: &Path,
+        source_root: Option<&Path>,
         rel_prefix: &Path,
         parent_filters: &FilterSet,
         entries: &mut Vec<TransferEntry>,
@@ -372,18 +427,45 @@ impl Walker {
             dir_filters.prepend_rules(new_rules);
         }
 
-        let mut read_entries = Vec::new();
-        for entry in fs::read_dir(dir_path)? {
-            read_entries.push(entry?.path());
-        }
-        // Sort lexicographically for deterministic order
-        read_entries.sort();
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
 
-        for child_path in read_entries {
+        for entry in fs::read_dir(dir_path)? {
+            let p = entry?.path();
+            let is_dir = match self.read_meta(&p) {
+                Ok(m) => m.file_type == FileType::Directory,
+                Err(_) => false,
+            };
+            if is_dir {
+                dirs.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+
+        // Sort lexicographically for deterministic order matching rsync flist
+        files.sort();
+        dirs.sort();
+
+        for child_path in files {
             let child_name = child_path.file_name().unwrap();
             let child_rel_dest = rel_prefix.join(child_name);
             self.scan_path(
                 &child_path,
+                source_root,
+                &child_rel_dest,
+                &mut dir_filters,
+                entries,
+                seen_dest_paths,
+            )?;
+        }
+
+        for child_path in dirs {
+            let child_name = child_path.file_name().unwrap();
+            let child_rel_dest = rel_prefix.join(child_name);
+            self.scan_path(
+                &child_path,
+                source_root,
                 &child_rel_dest,
                 &mut dir_filters,
                 entries,

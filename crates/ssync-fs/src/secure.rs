@@ -111,6 +111,81 @@ pub fn safe_create_dir_all(dest_root: &Path, target_dir: &Path) -> Result<(), Fs
     }
 }
 
+/// Opens a source file safely through held ancestor dirfds anchored at `source_root`.
+///
+/// If any parent component of `source_path` under `source_root` was flipped to a symlink,
+/// this function refuses the open with `ENOTDIR` or `ELOOP`, preventing source-tree TOCTOU leaks.
+pub fn safe_open_source(
+    source_path: &Path,
+    source_root: Option<&Path>,
+    follow_symlinks: bool,
+) -> Result<fs::File, std::io::Error> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let root = match source_root {
+        Some(r) => r,
+        None => return fs::File::open(source_path),
+    };
+
+    let (parent_rel, leaf_name) = if root.as_os_str() == "." || root.as_os_str().is_empty() {
+        (source_path.parent(), source_path.file_name())
+    } else if let Ok(rel) = source_path.strip_prefix(root) {
+        (rel.parent(), rel.file_name())
+    } else {
+        (source_path.parent(), source_path.file_name())
+    };
+
+    let leaf_name = match leaf_name {
+        Some(name) => name,
+        None => return fs::File::open(source_path),
+    };
+
+    let start_fd = if root.as_os_str().is_empty() {
+        DirFd::open_dir(Path::new("."), false)?
+    } else {
+        DirFd::open_dir(root, false)?
+    };
+
+    let parent_fd = if let Some(p) = parent_rel {
+        if p.as_os_str().is_empty() || p.as_os_str() == "." {
+            start_fd
+        } else {
+            let mut cur = start_fd;
+            for comp in p.components() {
+                match comp {
+                    std::path::Component::Normal(c) => {
+                        let next = cur.openat_dir(Path::new(c), !follow_symlinks)?;
+                        cur = next;
+                    }
+                    std::path::Component::CurDir => {}
+                    _ => {}
+                }
+            }
+            cur
+        }
+    } else {
+        start_fd
+    };
+
+    let leaf_c = CString::new(leaf_name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    if !follow_symlinks {
+        flags |= libc::O_NOFOLLOW;
+    }
+
+    // SAFETY: leaf_c is a valid C string, parent_fd.raw() is a valid open dir fd.
+    let fd = unsafe { libc::openat(parent_fd.raw(), leaf_c.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: fd is a valid open file descriptor.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
 /// Atomically renames `tmp_path` to `dest_path` while confining the destination relative to `dest_root`.
 ///
 /// Pins the destination's parent directory through held dirfds with `O_DIRECTORY | O_NOFOLLOW` and
@@ -121,6 +196,11 @@ pub fn safe_rename_into(
     tmp_path: &Path,
     dest_path: &Path,
 ) -> Result<(), FsError> {
+    if dest_path == dest_root {
+        fs::rename(tmp_path, dest_path)?;
+        return Ok(());
+    }
+
     if let Ok(rel) = dest_path.strip_prefix(dest_root) {
         let parent_rel = rel.parent();
         let leaf_name = rel.file_name().ok_or_else(|| {

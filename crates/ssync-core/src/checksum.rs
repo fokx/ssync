@@ -182,13 +182,12 @@ pub fn calculate_strong_checksum(
     }
 }
 
-/// Computes the full file checksum for quick-check (-c) or whole-file verification.
-pub fn calculate_file_checksum(
+/// Computes the checksum of data read from a reader.
+pub fn calculate_reader_checksum<R: Read>(
     algo: ChecksumAlgorithm,
-    path: &Path,
+    mut reader: R,
     seed: Option<u32>,
 ) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
     let mut buffer = [0u8; 65536];
     let seed_bytes = seed.map(|s| s.to_le_bytes());
 
@@ -199,7 +198,7 @@ pub fn calculate_file_checksum(
                 hasher.update(sb);
             }
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = reader.read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -213,7 +212,7 @@ pub fn calculate_file_checksum(
                 hasher.update(sb);
             }
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = reader.read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -227,7 +226,7 @@ pub fn calculate_file_checksum(
                 hasher.update(sb);
             }
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = reader.read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -239,7 +238,7 @@ pub fn calculate_file_checksum(
             let s = seed.unwrap_or(0) as u64;
             let mut hasher = xxhash_rust::xxh64::Xxh64::new(s);
             loop {
-                let n = file.read(&mut buffer)?;
+                let n = reader.read(&mut buffer)?;
                 if n == 0 {
                     break;
                 }
@@ -248,6 +247,16 @@ pub fn calculate_file_checksum(
             Ok(hasher.digest().to_be_bytes().to_vec())
         }
     }
+}
+
+/// Computes the full file checksum for quick-check (-c) or whole-file verification.
+pub fn calculate_file_checksum(
+    algo: ChecksumAlgorithm,
+    path: &Path,
+    seed: Option<u32>,
+) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    calculate_reader_checksum(algo, file, seed)
 }
 
 #[cfg(target_arch = "x86_64")]

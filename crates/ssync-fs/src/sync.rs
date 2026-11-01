@@ -3,15 +3,15 @@
 use crate::FsError;
 use crate::filter::FilterSet;
 use crate::metadata::{FileMetadata, FileType};
-use crate::secure::{safe_create_dir_all, safe_rename_into};
+use crate::secure::{safe_create_dir_all, safe_open_source, safe_rename_into};
 use crate::walker::TransferEntry;
-use ssync_core::checksum::{ChecksumAlgorithm, calculate_file_checksum};
+use ssync_core::checksum::{ChecksumAlgorithm, calculate_file_checksum, calculate_reader_checksum};
 use ssync_core::delta::{
     MatchStats, SumStruct, generate_basis_signatures, generate_delta, reconstruct_file,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Match type for alternate destination directory.
@@ -69,11 +69,64 @@ pub struct SyncOptions {
     pub copy_dest: Vec<PathBuf>,
     pub compare_dest: Vec<PathBuf>,
     pub dest_is_file: bool,
+    pub relative: bool,
+    pub sparse: bool,
+    pub copy_links: bool,
+    pub copy_dirlinks: bool,
+    pub copy_unsafe_links: bool,
     pub filters: FilterSet,
 }
 
 pub struct SyncEngine {
     options: SyncOptions,
+}
+
+fn format_thousands(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut parts = Vec::new();
+    while n > 0 {
+        let rem = n % 1000;
+        n /= 1000;
+        if n > 0 {
+            parts.push(format!("{:03}", rem));
+        } else {
+            parts.push(format!("{}", rem));
+        }
+    }
+    parts.reverse();
+    parts.join(",")
+}
+
+fn copy_sparse(reader: &mut File, writer: &mut File, total_len: u64) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 8192];
+    let mut pending_zeros = 0u64;
+
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buffer[..n];
+        let is_all_zero = chunk.iter().all(|&b| b == 0);
+
+        if is_all_zero {
+            pending_zeros += n as u64;
+        } else {
+            if pending_zeros > 0 {
+                writer.seek(SeekFrom::Current(pending_zeros as i64))?;
+                pending_zeros = 0;
+            }
+            writer.write_all(chunk)?;
+        }
+    }
+
+    if pending_zeros > 0 {
+        writer.seek(SeekFrom::Current(pending_zeros as i64))?;
+    }
+    writer.set_len(total_len)?;
+    Ok(total_len)
 }
 
 impl SyncEngine {
@@ -344,8 +397,14 @@ impl SyncEngine {
         }
 
         if self.options.stats {
-            println!("Literal data: {} bytes", total_stats.literal_bytes);
-            println!("Matched data: {} bytes", total_stats.matched_bytes);
+            println!(
+                "Literal data: {} bytes",
+                format_thousands(total_stats.literal_bytes)
+            );
+            println!(
+                "Matched data: {} bytes",
+                format_thousands(total_stats.matched_bytes)
+            );
         }
 
         if had_partial_error {
@@ -366,6 +425,11 @@ impl SyncEngine {
         let is_root = entry.relative_dest_path.as_os_str().is_empty();
         let display_dir = if is_root {
             "./".to_string()
+        } else if self.options.relative
+            && entry.source_path.is_absolute()
+            && !entry.source_path.to_string_lossy().contains("/./")
+        {
+            format!("/{}/", entry.relative_dest_path.display())
         } else {
             format!("{}/", entry.relative_dest_path.display())
         };
@@ -693,6 +757,11 @@ impl SyncEngine {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default()
+        } else if self.options.relative
+            && entry.source_path.is_absolute()
+            && !entry.source_path.to_string_lossy().contains("/./")
+        {
+            format!("/{}", entry.relative_dest_path.display())
         } else {
             entry.relative_dest_path.display().to_string()
         };
@@ -910,8 +979,13 @@ impl SyncEngine {
                     needs_transfer = true;
                     itemize_char_size = 's';
                 } else {
+                    let follow = self.options.copy_links
+                        || self.options.copy_unsafe_links
+                        || self.options.copy_dirlinks;
+                    let src_file =
+                        safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
                     let src_sum =
-                        calculate_file_checksum(ChecksumAlgorithm::Md5, &entry.source_path, None)?;
+                        calculate_reader_checksum(ChecksumAlgorithm::Md5, src_file, None)?;
                     let dst_sum = calculate_file_checksum(ChecksumAlgorithm::Md5, dest_path, None)?;
                     if src_sum != dst_sum {
                         needs_transfer = true;
@@ -1080,7 +1154,10 @@ impl SyncEngine {
             return Ok(());
         }
 
-        let mut src_file = File::open(&entry.source_path)?;
+        let follow =
+            self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
+        let mut src_file =
+            safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
         src_file.seek(SeekFrom::Start(dst_len))?;
 
         let mut dst_file = OpenOptions::new().write(true).open(dest_path)?;
@@ -1091,11 +1168,13 @@ impl SyncEngine {
         total_stats.literal_bytes += appended;
 
         if self.options.append_verify {
-            let src_sum =
-                calculate_file_checksum(ChecksumAlgorithm::Md5, &entry.source_path, None)?;
+            let src_file =
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
+            let src_sum = calculate_reader_checksum(ChecksumAlgorithm::Md5, src_file, None)?;
             let dst_sum = calculate_file_checksum(ChecksumAlgorithm::Md5, dest_path, None)?;
             if src_sum != dst_sum {
-                let mut full_src = File::open(&entry.source_path)?;
+                let mut full_src =
+                    safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
                 let mut full_dst = OpenOptions::new()
                     .write(true)
                     .truncate(true)
@@ -1116,10 +1195,15 @@ impl SyncEngine {
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         let is_delta_mode = self.options.no_whole_file && dest_path.exists();
+        let follow =
+            self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
 
         if is_delta_mode {
             let basis = fs::read(dest_path)?;
-            let source = fs::read(&entry.source_path)?;
+            let mut src_file =
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
+            let mut source = Vec::new();
+            src_file.read_to_end(&mut source)?;
             let sums = SumStruct::calculate(
                 basis.len() as u64,
                 self.options.block_size,
@@ -1145,13 +1229,18 @@ impl SyncEngine {
             f.write_all(&reconstructed)?;
             f.flush()?;
         } else {
-            let mut src_file = File::open(&entry.source_path)?;
+            let mut src_file =
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
             let mut dst_file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(dest_path)?;
-            let copied = std::io::copy(&mut src_file, &mut dst_file)?;
+            let copied = if self.options.sparse {
+                copy_sparse(&mut src_file, &mut dst_file, entry.metadata.size)?
+            } else {
+                std::io::copy(&mut src_file, &mut dst_file)?
+            };
             dst_file.flush()?;
             total_stats.literal_bytes += copied;
         }
@@ -1178,10 +1267,15 @@ impl SyncEngine {
         };
 
         let is_delta_mode = self.options.no_whole_file && dest_path.exists();
+        let follow =
+            self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
 
         if is_delta_mode {
             let basis = fs::read(dest_path)?;
-            let source = fs::read(&entry.source_path)?;
+            let mut src_file =
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
+            let mut source = Vec::new();
+            src_file.read_to_end(&mut source)?;
             let sums = SumStruct::calculate(
                 basis.len() as u64,
                 self.options.block_size,
@@ -1205,7 +1299,31 @@ impl SyncEngine {
                 return Err(FsError::Io(e));
             }
         } else {
-            match fs::copy(&entry.source_path, &tmp_path) {
+            let copy_res =
+                if self.options.sparse {
+                    safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)
+                        .and_then(|mut src| {
+                            OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .open(&tmp_path)
+                                .and_then(|mut dst| {
+                                    copy_sparse(&mut src, &mut dst, entry.metadata.size)
+                                })
+                        })
+                } else {
+                    safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)
+                        .and_then(|mut src| {
+                            OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .open(&tmp_path)
+                                .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
+                        })
+                };
+            match copy_res {
                 Ok(copied) => total_stats.literal_bytes += copied,
                 Err(e) => {
                     let _ = fs::remove_file(&tmp_path);
@@ -1248,7 +1366,31 @@ impl SyncEngine {
         let file_name = dest_path.file_name().unwrap();
         let staged_file = staging_dir.join(file_name);
 
-        let copied = fs::copy(&entry.source_path, &staged_file)?;
+        let follow =
+            self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
+        let copied = if self.options.sparse {
+            safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow).and_then(
+                |mut src| {
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&staged_file)
+                        .and_then(|mut dst| copy_sparse(&mut src, &mut dst, entry.metadata.size))
+                },
+            )?
+        } else {
+            safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow).and_then(
+                |mut src| {
+                    OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&staged_file)
+                        .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
+                },
+            )?
+        };
         total_stats.literal_bytes += copied;
 
         delayed_updates.push((staged_file, dest_path.to_path_buf()));

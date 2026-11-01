@@ -545,9 +545,11 @@ impl FilterSet {
             }
             "." => {
                 if pattern == "-" {
-                    let _ = self.load_stdin(RuleAction::Exclude);
+                    self.load_stdin(RuleAction::Exclude)
+                        .map_err(|e| format!("failed to read stdin filter rules: {}", e))?;
                 } else {
-                    let _ = self.load_file(Path::new(pattern), RuleAction::Exclude);
+                    self.load_file(Path::new(pattern), RuleAction::Exclude)
+                        .map_err(|e| format!("cannot open filter file '{}': {}", pattern, e))?;
                 }
             }
             "+" => {
