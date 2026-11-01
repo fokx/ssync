@@ -360,3 +360,20 @@ Outputs an 11-character string describing each item's modification:
   - Symlinks with absolute targets (starting with `/`) or null targets are always unsafe.
   - Targets with `..` components other than leading `../` (e.g. `a/a/a/../../../unsafe` or `foo/../bar`) are always rejected as unsafe because intermediate directory components could later become symlinks, leading to an escape.
   - For clean targets with only leading `../`, the target is unsafe if the count of leading `../` components strictly exceeds the directory depth of the symlink from the transfer root.
+
+---
+
+## 7. Security Hardening & Confinement
+
+### Held-Dirfd Directory Confinement (`safe_create_dir_all`, `safe_rename_into`, `safe_open_source`)
+- **Vulnerability Model**: An attacker or untrusted local user concurrently alternates a destination path component between a real subdirectory and a symlink pointing outside the transfer tree (`outside`). If standard recursive `mkdir` or `rename` traverses paths stringwise, it follows the planted symlink and creates directories or drops files into arbitrary target locations outside the destination root.
+- **Confinement Invariant**:
+  - Path traversal is anchored at the root using an open file descriptor (`DirFd`).
+  - Intermediate directories are resolved iteratively component-by-component via `libc::openat(cur_fd, component, O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)`.
+  - If a component is a symlink, `openat` fails with `ENOTDIR` or `ELOOP`, preventing symlink following.
+  - Directory creation uses `libc::mkdirat(cur_fd, component, mode)`.
+  - Atomic rename uses `libc::renameat(src_parent_fd, src_name, dst_parent_fd, dst_name)` pinned to held directory handles, guaranteeing that neither source nor destination parent directory can be swapped to an escaping symlink before `renameat` executes.
+- **Source-Side TOCTOU Protection (`safe_open_source`)**:
+  - The sender must not follow symlinks flipped after the directory scan phase. Opening each source file is performed through held ancestor dirfds anchored at `source_root` with `O_NOFOLLOW`. Symlink following flags (`-L`, `-k`, `--copy-links`, `--copy-dirlinks`, `--copy-unsafe-links`) selectively allow following according to operator policy.
+- **Sparse File Preservation (`copy_sparse`)**:
+  - Files containing sparse zero-filled regions are copied by scanning 8KiB blocks. Unmodified blocks of all zero bytes advance the output file pointer via `seek(SeekFrom::Current(n))`. The file length is finalized via `set_len(total_len)`, leaving unallocated sparse holes and matching rsync literal byte accounting.

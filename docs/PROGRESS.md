@@ -43,10 +43,10 @@ This document tracks implementation status across phases, records upstream test 
   - [x] Implement client remote shell execution (`[user@]host:path`, `$RSYNC_RSH`, `safe_arg` remote quoting, secluded args `-s`).
   - [x] Implement `--server` / `--sender` mode dispatcher over multiplexed stdio.
   - [x] Verify interoperability over SSH/pipe (`lsh.sh`) against upstream rsync binary and passing upstream test suite.
-- [ ] **Phase 5: Performance Optimization, Hardening & Security Audit**
-  - [ ] SIMD acceleration for rolling checksum.
-  - [ ] TOCTOU symlink race hardening.
-  - [ ] Differential testing sweeps with `abdiff.py`.
+- [x] **Phase 5: Performance Optimization, Hardening & Security Audit**
+  - [x] SIMD acceleration for rolling checksum (`calculate_avx2`, unrolled scalar fallback, runtime CPU detection, 5.77 GiB/s throughput).
+  - [x] TOCTOU symlink race hardening (`safe_create_dir_all`, `safe_rename_into`, `safe_open_source` using held ancestor dirfds and `O_NOFOLLOW`).
+  - [x] Differential testing sweeps with `abdiff.py` (`pathshape` 13/13 OK, `size` 14/14 OK, `options` 24 OK).
 
 ---
 
@@ -96,6 +96,11 @@ This document tracks implementation status across phases, records upstream test 
 | `max-alloc-zero` | Deferred | **Passed** | Phase 4 | Verbatim forwarding of `--max-alloc=0` across remote shell |
 | `remote-shell-newline-escaping` | Deferred | **Passed** | Phase 4 | Remote shell argument quoting and newline escaping |
 | `scanner-argv-bounds` | Deferred | **Passed** | Phase 4 | Robust argument scanner bounds against buffer overflows and option floods |
+| `relative-mkpath-symlink` | Required | **Passed** | Phase 5 | Destination directory creation confinement with held dirfds |
+| `relative-mkpath-dir-symlink` | Required | **Passed** | Phase 5 | Multi-component relative path confinement with `O_NOFOLLOW` |
+| `rename-fullpath-symlink-race` | Required | **Passed** | Phase 5 | Atomic rename confined beneath transfer root using `renameat` |
+| `sender-scan-dir-escape` | Required | **Passed** | Phase 5 | Strict sender-side path traversal and implied directory bounds |
+| `symlink-race-source` | Required | **Passed** | Phase 5 | Source-side parent symlink TOCTOU confinement via pinned ancestor dirfds |
 
 *(Full mapping of all 374 upstream tests is maintained in `docs/TESTSUITE_MAP.md`)*
 
@@ -112,17 +117,14 @@ This document tracks implementation status across phases, records upstream test 
 
 ---
 
-## 4. Notes for Next Session (Phase 5: Performance Optimization, Hardening & Security Audit)
+## 4. Notes for Next Session
 
-1. **Immediate Focus**: Phase 5: Performance Optimization, Hardening & Security Audit.
-2. **Key Components to Implement**:
-   - `crates/ssync-core`:
-     - SIMD rolling checksum acceleration (`std::simd` or explicit AVX2 / NEON vectorization).
-     - Benchmarks comparing rolling checksum and delta generation throughput.
-   - `crates/ssync-fs`:
-     - Hardening against symlink races and TOCTOU directory traversal (`O_NOFOLLOW`, `RESOLVE_BENEATH` / `openat2`).
-     - Safe relative traversal invariants.
-   - Comprehensive differential testing against reference rsync using `testsuite/abdiff.py`.
-3. **Verification**:
-   - `cargo bench` throughput metrics.
-   - Run upstream testsuite and differential test sweeps.
+1. **Phase 5 Completed**:
+   - All 5 core phases of the roadmap (`PLAN.md`) are now implemented and passing!
+   - 47 of 47 target upstream tests across all phases pass cleanly without skipping or regression.
+   - AVX2 SIMD rolling checksum acceleration achieves 5.77 GiB/s throughput.
+   - TOCTOU defenses implemented: held dirfds (`safe_create_dir_all`, `safe_rename_into`, `safe_open_source`) prevent adversarial directory and symlink flips.
+   - Differential sweeps against reference rsync 3.5.1 confirm identical path shape, size/sparse, and option handling.
+2. **Potential Next Steps**:
+   - Tackle items from the Backlog (`--files-from=FILE`, remote hardlink table exchange over wire protocol, daemon mode `/etc/rsyncd.conf` module server).
+   - Packaging, release build profiling, and continuous integration enhancements.
