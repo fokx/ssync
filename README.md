@@ -2,99 +2,138 @@
 
 A fast, memory-safe, clean-room reimplementation of `rsync` in Rust.
 
-## Goals
+[![Crates.io](https://img.shields.io/crates/v/ssync.svg)](https://crates.io/crates/ssync)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![CI](https://github.com/ssync/ssync/actions/workflows/ci.yml/badge.svg)](https://github.com/ssync/ssync/actions)
+[![MSRV: 1.85.0](https://img.shields.io/badge/MSRV-1.85.0-informational.svg)](https://blog.rust-lang.org/)
 
-- **Algorithmically faithful**: Faithful implementation of the rsync delta-transfer algorithm (rolling checksum + strong hash block matching).
-- **Flag compatible**: Drop-in compatible CLI flag subset matching standard `rsync`, verified against upstream rsync regression test suites.
-- **Modern & Safe**: Built with modern Rust (Edition 2024, MSRV 1.85.0), strict safety guarantees (`#![forbid(unsafe_code)]` in safe crates), and zero copyleft licensing obligations.
+---
+
+## Overview
+
+`ssync` is a modern, high-performance file transfer and synchronization tool. It faithfully implements the `rsync` delta-transfer algorithm, wire protocol 31, and common command-line flags while providing strict memory safety guarantees and robust security against symlink-based attacks.
+
+### Key Goals & Highlights
+
+- **Algorithmically faithful**: Full implementation of the rsync delta-transfer algorithm (weak rolling checksum + strong hash block matching, chunk-sliding window, tokenized reconstructor).
+- **Flag compatible**: Drop-in compatible CLI flag subset matching standard `rsync`, verified against upstream rsync test suites.
+- **Wire Protocol 31**: Fully interoperable with upstream `rsync` over SSH or daemon mode via standard I/O multiplexing.
+- **Modern & Safe**: Built with modern Rust (Edition 2024, MSRV 1.85.0), strict safety invariants (`#![forbid(unsafe_code)]` in safe crates), and permissive Apache-2.0 licensing.
+- **SIMD Accelerated**: AVX2-accelerated and SWAR unrolled rolling checksum engines for blazing fast delta scans.
+- **Race Hardened**: Directory confinement and symlink race mitigation using held directory file descriptors (`dirfd`).
+
+---
+
+## Installation
+
+### From crates.io
+
+```bash
+cargo install ssync
+```
+
+### From Source
+
+```bash
+git clone https://github.com/ssync/ssync.git
+cd ssync
+cargo install --path crates/ssync-cli
+```
+
+---
+
+## Quickstart
+
+### Local Synchronization
+
+```bash
+# Basic recursive copy preserving metadata (archive mode) with verbose progress
+ssync -av /path/to/source/ /path/to/dest/
+
+# Itemized changes output (-i) with delete extraneous destination files
+ssync -avi --delete /path/to/source/ /path/to/dest/
+
+# Exclude patterns and ignore rules
+ssync -av --exclude="*.tmp" --exclude="target/" /path/to/source/ /path/to/dest/
+```
+
+### Remote Synchronization over SSH
+
+```bash
+# Push local directory to remote host
+ssync -avz /local/path/ user@remote.host:/remote/path/
+
+# Pull remote directory to local destination
+ssync -avz user@remote.host:/remote/path/ /local/path/
+
+# Custom remote shell or port
+ssync -avz -e "ssh -p 2222" /local/path/ user@remote.host:/remote/path/
+```
+
+---
+
+## Architecture & Workspace Crates
+
+`ssync` is engineered as a modular Cargo workspace:
+
+| Crate | Crates.io | Description |
+|:------|:----------|:------------|
+| [`ssync`](crates/ssync-cli) | [![Crates.io](https://img.shields.io/crates/v/ssync.svg)](https://crates.io/crates/ssync) | CLI application binary, argument parser, and orchestrator |
+| [`ssync-core`](crates/ssync-core) | [![Crates.io](https://img.shields.io/crates/v/ssync-core.svg)](https://crates.io/crates/ssync-core) | Rolling checksums (AVX2/SIMD), digests (MD4, MD5, XXH, SHA1), and delta engine |
+| [`ssync-fs`](crates/ssync-fs) | [![Crates.io](https://img.shields.io/crates/v/ssync-fs.svg)](https://crates.io/crates/ssync-fs) | Directory traversal, metadata preservation, filters, and held-dirfd security |
+| [`ssync-proto`](crates/ssync-proto) | [![Crates.io](https://img.shields.io/crates/v/ssync-proto.svg)](https://crates.io/crates/ssync-proto) | Wire protocol 31, varint encoders, packet multiplexing, and file list codecs |
+
+---
+
+## Security Invariants
+
+`ssync` incorporates defense-in-depth protections against filesystem race conditions and traversal attacks:
+
+- **Held-`dirfd` Isolation**: Paths are opened and traversed relative to parent file descriptors (`openat`, `fstatat`, `unlinkat`), preventing directory-swap TOCTOU vulnerabilities.
+- **Symlink Confinement**: Symlink targets are strictly checked against destination boundaries (`--safe-links` and `--copy-unsafe-links`) to prevent arbitrary directory breakouts.
+- **Sparse File Safety**: Sparse file hole-punching and detection avoid unnecessary I/O while preserving physical disk allocations.
+
+---
+
+## Supported Options
+
+`ssync` supports the core options required for day-to-day syncing, backup scripts, and upstream interoperability:
+
+- **Transfer Modes**: `-a, --archive` (`-rlptgoD`), `-r, --recursive`, `-d, --dirs`, `-R, --relative`, `--no-implied-dirs`.
+- **Symlink Handling**: `-l, --links`, `-L, --copy-links`, `-k, --copy-dirlinks`, `--safe-links`, `--copy-unsafe-links`.
+- **Metadata**: `-p, --perms`, `-t, --times`, `-O, --omit-dir-times`, `-o, --owner`, `-g, --group`, `-H, --hard-links`.
+- **Heuristics & Checks**: `-c, --checksum`, `-u, --update`, `-I, --ignore-times`, `--size-only`, `--modify-window=N`.
+- **Delta Transfer**: `--inplace`, `--append`, `--append-verify`, `--block-size=N`, `--stats`.
+- **Deletion**: `--delete, --del`, `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`, `--delete-excluded`, `--max-delete=NUM`.
+- **Filtering**: `-f, --filter=RULE`, `--exclude=PATTERN`, `--include=PATTERN`, `--exclude-from=FILE`, `--include-from=FILE`, `-C, --cvs-exclude`, `-F`.
+- **Backups & Staging**: `-b, --backup`, `--backup-dir=DIR`, `--suffix=SUFFIX`, `--delay-updates`, `-T, --temp-dir=DIR`, `--remove-source-files`.
+- **Alternates**: `--link-dest=DIR`, `--copy-dest=DIR`, `--compare-dest=DIR`.
+- **Remote & Protocol**: `[user@]host:path`, `-e, --rsh=CMD`, `--rsync-path=PROG`, `-s, --protect-args`, `--old-args`, `--server`, `--sender`, `-z, --compress`, `--max-alloc=SIZE`.
+- **Output & Diagnostics**: `-v, --verbose`, `-q, --quiet`, `-n, --dry-run`, `-i, --itemize-changes`, `--info=help`, `--debug=help`.
+
+---
+
+## Building & Testing
+
+```bash
+# Build the workspace
+cargo build --workspace
+
+# Run all unit and integration tests
+cargo test --workspace
+
+# Run linter and formatting checks
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Execute upstream rsync test suite against ssync binary
+./scripts/run_upstream_tests.sh hands dirs links relative
+```
+
+---
 
 ## License
 
 `ssync` is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or [LICENSE-APACHE](LICENSE-APACHE)).
 
 Upstream reference code (`/f/rsync`, GPL-3.0-or-later) is strictly consulted for behavioral specification and protocol verification; no upstream code or test scripts are copied into this repository. See [docs/DECISIONS.md](docs/DECISIONS.md) for licensing and architectural rationale.
-
-## Documentation
-
-- [RSYNC_NOTES.md](docs/RSYNC_NOTES.md): Comprehensive analysis of rsync protocol versions, file-list wire encoding, delta algorithm, and option interactions.
-- [TESTSUITE_MAP.md](docs/TESTSUITE_MAP.md): Complete map and classification of all 374 upstream rsync automated tests.
-- [DECISIONS.md](docs/DECISIONS.md): Architectural decisions (licensing, crate layout, dependencies, wire compatibility).
-- [PLAN.md](docs/PLAN.md): Phased roadmap with deliverables and acceptance criteria.
-- [PROGRESS.md](docs/PROGRESS.md): Persistent progress tracker and backlog.
-- [CONVENTIONS.md](docs/CONVENTIONS.md): Coding guidelines, error handling, unsafe policy, and commit style.
-
-## Building & Testing
-
-```bash
-# Build all crates in the workspace
-cargo build --workspace
-
-# Run all workspace unit and integration tests
-cargo test --workspace
-
-# Check formatting and clippy
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Run upstream rsync tests against ssync binary
-./scripts/run_upstream_tests.sh hands dirs links relative
-```
-
-## Supported Flags (Phase 1, Phase 2, Phase 3 & Phase 4)
-
-`ssync` currently supports local and remote recursive file transfer, metadata synchronization, delta transfers, advanced filtering/staging, and wire protocol 31:
-- Remote synchronization: `[user@]host:path` source and destination syntax over SSH or custom remote shells (`-e, --rsh`, `$RSYNC_RSH`).
-- `--server`, `--sender`: Protocol 31 server execution over standard I/O streams with multiplexed framing.
-- `-s, --protect-args, --secluded-args`: Protect remote arguments from shell expansion via null-delimited stream.
-- `--old-args`: Pass remote arguments unquoted.
-- `--rsync-path=PROGRAM`: Specify the remote rsync executable.
-- `--max-alloc=SIZE`: Set maximum memory allocation limit (`0` for unlimited).
-- `-z, --compress`: Compressed transfer flag parsing.
-- `--info=help`, `--debug=help`: Structured diagnostic help output matching upstream rsync.
-- `-a, --archive`: Archive mode (equivalent to `-rlptgoD`).
-- `-r, --recursive`: Recurse into directories.
-- `-l, --links`: Copy symlinks as symlinks.
-- `-L, --copy-links`: Dereference symlinks into their referents.
-- `-k, --copy-dirlinks`: Treat symlinked directories as directories.
-- `-p, --perms`: Preserve permissions / mode.
-- `-t, --times`: Preserve modification times (nanosecond precision).
-- `-O, --omit-dir-times`: Omit directories when setting modification times.
-- `-o, --owner`, `-g, --group`: Preserve owner and group (best effort).
-- `-d, --dirs`: Transfer directories without recursing into them.
-- `-R, --relative`: Relative path replication with `./` cut point support.
-- `--no-implied-dirs`: Implied directories created with default permissions.
-- `-c, --checksum`: Skip-check based on whole-file strong checksum rather than mtime + size.
-- `-u, --update`: Skip files that are newer on the destination.
-- `-I, --ignore-times`: Disable quick check; transfer all files.
-- `--size-only`: Skip files that match in size, ignoring mtime.
-- `--modify-window=N`: Timestamp equivalence window in seconds (default: 0).
-- `--inplace`: Update destination files in-place without staging temp file.
-- `--append`: Append data onto shorter files without rewriting prefix.
-- `--append-verify`: Append data with whole-file checksum verification, re-sending on mismatch.
-- `--force`: Force removal of non-empty destination directories when replaced by regular files.
-- `--max-size=SIZE`, `--min-size=SIZE`: Transfer only files within byte size thresholds.
-- `--block-size=N`: Set fixed checksum block size for delta matching.
-- `--stats`: Output transfer statistics (literal data, matched data).
-- `-H, --hard-links`: Preserve hard link relationships.
-- `--delete, --del`: Delete extraneous destination files.
-- `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`: Precise deletion timing.
-- `--delete-excluded`: Delete excluded files from destination.
-- `--max-delete=NUM`: Limit the maximum number of deleted files.
-- `--existing`: Only update files that already exist on destination.
-- `--ignore-existing`: Skip updating files that already exist on destination.
-- `-m, --prune-empty-dirs`: Prune empty directory chains from file-list.
-- `-f, --filter=RULE`: Rule-based filtering (`+`, `-`, `P`, `R`, `H`, `S`, `!`, `.`, `:`, `dir-merge`).
-- `--exclude=PATTERN`, `--include=PATTERN`: Include/exclude pattern filters.
-- `--exclude-from=FILE`, `--include-from=FILE`: Load rules from files.
-- `-C, --cvs-exclude`: CVS exclusion rules and per-directory `.cvsignore` merge.
-- `-F`: Shorthand for `:C` (dir-merge `.cvsignore`) / `-C`.
-- `-b, --backup`: Make backups of updated or deleted files.
-- `--backup-dir=DIR`: Relocate backups to designated directory hierarchy.
-- `--suffix=SUFFIX`: Backup filename suffix (default `~`).
-- `--delay-updates`: Stage updated files until the transfer pass is finished.
-- `-T, --temp-dir=DIR`: Use temporary directory for staging during transfer.
-- `--remove-source-files`: Remove source files after successful transfer.
-- `--link-dest=DIR`, `--copy-dest=DIR`, `--compare-dest=DIR`: Alternate destination basis trees.
-- `--safe-links`, `--copy-unsafe-links`: Path-escape link handling.
-- `-i, --itemize-changes`: 11-character itemized change summary (`-ii` for unchanged items).
-- `-v, --verbose`, `-q, --quiet`, `-n, --dry-run`.

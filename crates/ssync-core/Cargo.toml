@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Core algorithms, checksums, and delta-transfer engine for ssync"
+repository.workspace = true
+readme = "README.md"
+keywords = ["rsync", "checksum", "rolling-hash", "delta-transfer", "adler32"]
+categories = ["algorithms", "filesystem"]
 
 [dependencies]
 thiserror.workspace = true

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "rsync wire protocol 31 implementation and multiplexing for ssync"
+repository.workspace = true
+readme = "README.md"
+keywords = ["rsync", "protocol", "network", "multiplexing", "wire"]
+categories = ["network-programming"]
 
 [dependencies]
 ssync-core.workspace = true
