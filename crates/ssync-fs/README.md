@@ -18,7 +18,7 @@ Filesystem traversal, metadata preservation, and path security for [ssync](https
 
 ```toml
 [dependencies]
-ssync-fs = "0.1.0"
+ssync-fs = "0.2.0"
 ```
 
 ## License

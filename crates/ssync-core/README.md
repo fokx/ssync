@@ -16,7 +16,7 @@ Core algorithms, checksums, and delta-transfer engine for [ssync](https://crates
 
 ```toml
 [dependencies]
-ssync-core = "0.1.0"
+ssync-core = "0.2.0"
 ```
 
 ## License

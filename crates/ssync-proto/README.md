@@ -18,7 +18,7 @@ rsync wire protocol 31 implementation and multiplexing for [ssync](https://crate
 
 ```toml
 [dependencies]
-ssync-proto = "0.1.0"
+ssync-proto = "0.2.0"
 ```
 
 ## License

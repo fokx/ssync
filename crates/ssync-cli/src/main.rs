@@ -639,7 +639,7 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.version {
-        println!("ssync version 0.1.0  protocol version 31");
+        println!("ssync version 0.2.0  protocol version 31");
         return;
     }
 
@@ -657,7 +657,7 @@ fn main() {
         );
         return;
     } else if cli.version_caps == 1 {
-        println!("ssync version 0.1.0  protocol version 31");
+        println!("ssync version 0.2.0  protocol version 31");
         return;
     }
 
