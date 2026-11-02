@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Match type for alternate destination directory.
@@ -82,6 +82,7 @@ pub struct SyncOptions {
     pub copy_unsafe_links: bool,
     pub safe_links: bool,
     pub mkpath: bool,
+    pub fuzzy: u8,
     pub filters: FilterSet,
     pub out_format: Option<String>,
     pub human_readable: u8,
@@ -318,9 +319,219 @@ fn count_missing_dirs(path: &Path) -> usize {
     count
 }
 
+/// Levenshtein unit distance scale factor used by rsync.
+pub const UNIT: u32 = 1 << 16;
+
+/// Candidate file for `--fuzzy` basis delta transfer.
+#[derive(Debug, Clone)]
+pub struct FuzzyCandidate {
+    pub filename: String,
+    pub full_path: PathBuf,
+}
+
+/// Extracts significant filename suffix, ignoring backup/temporary suffixes like "~", ".bak", ".orig".
+pub fn find_filename_suffix(name: &str) -> &str {
+    let mut fn_bytes = name.as_bytes();
+    while !fn_bytes.is_empty() && fn_bytes[0] == b'.' {
+        fn_bytes = &fn_bytes[1..];
+    }
+
+    let mut had_tilde = false;
+    if fn_bytes.len() > 1 && fn_bytes[fn_bytes.len() - 1] == b'~' {
+        fn_bytes = &fn_bytes[..fn_bytes.len() - 1];
+        had_tilde = true;
+    }
+
+    let mut fn_len = fn_bytes.len();
+    let mut suf_slice: &[u8] = b"";
+
+    while fn_len > 1 {
+        let mut idx = fn_len - 1;
+        while idx > 0 && fn_bytes[idx] != b'.' {
+            idx -= 1;
+        }
+        if fn_bytes[idx] != b'.' {
+            break;
+        }
+
+        let s_len = fn_len - idx;
+        fn_len = idx;
+
+        let s = &fn_bytes[idx..idx + s_len];
+        if s_len == 4 && (&s[1..] == b"bak" || &s[1..] == b"old") {
+            continue;
+        }
+        if s_len == 5 && &s[1..] == b"orig" {
+            continue;
+        }
+        if s_len > 2 && had_tilde && s[1] == b'~' && s[2].is_ascii_digit() {
+            continue;
+        }
+
+        suf_slice = s;
+        if s_len == 1 {
+            break;
+        }
+
+        if !s[1..].iter().all(|b| b.is_ascii_digit()) {
+            return std::str::from_utf8(suf_slice).unwrap_or("");
+        }
+    }
+
+    std::str::from_utf8(suf_slice).unwrap_or("")
+}
+
+/// Computes the rsync Levenshtein edit distance scaled by UNIT with ASCII character distance factoring.
+pub fn fuzzy_distance(s1: &[u8], s2: &[u8], upperlimit: u32) -> u32 {
+    let len1 = s1.len() as u32;
+    let len2 = s2.len() as u32;
+
+    let diff = len1.abs_diff(len2);
+    if diff.saturating_mul(UNIT) > upperlimit {
+        return 0xFFFF * UNIT + 1;
+    }
+
+    if len1 == 0 || len2 == 0 {
+        let (s, len) = if len1 == 0 { (s2, len2) } else { (s1, len1) };
+        let mut cost: u32 = 0;
+        for &b in s {
+            cost = cost.wrapping_add(b as u32);
+        }
+        return len * UNIT + cost;
+    }
+
+    let mut a: Vec<u32> = (1..=len2).map(|i| i * UNIT).collect();
+
+    for (i1, &b1_byte) in s1.iter().enumerate() {
+        let mut diag = (i1 as u32) * UNIT;
+        let mut above = ((i1 as u32) + 1) * UNIT;
+        let b1 = b1_byte as u32;
+
+        for (i2, &b2_byte) in s2.iter().enumerate() {
+            let left = a[i2];
+            let b2 = b2_byte as u32;
+
+            let cost = if b1 != b2 {
+                let d = (b1 as i32) - (b2 as i32);
+                if d < 0 {
+                    (UNIT as i32 - d) as u32
+                } else {
+                    (UNIT as i32 + d) as u32
+                }
+            } else {
+                0
+            };
+
+            let diag_inc = diag.wrapping_add(cost);
+            let left_inc = left.wrapping_add(UNIT).wrapping_add(b1);
+            let above_inc = above.wrapping_add(UNIT).wrapping_add(b2);
+
+            let val = if left < above {
+                if left_inc < diag_inc {
+                    left_inc
+                } else {
+                    diag_inc
+                }
+            } else if above_inc < diag_inc {
+                above_inc
+            } else {
+                diag_inc
+            };
+
+            a[i2] = val;
+            above = val;
+            diag = left;
+        }
+    }
+
+    a[s2.len() - 1]
+}
+
 impl SyncEngine {
     pub fn new(options: SyncOptions) -> Self {
         Self { options }
+    }
+
+    /// Scans the destination directory for a similarly named file to use as delta basis under `--fuzzy`.
+    pub fn find_fuzzy_candidate(
+        &self,
+        entry: &TransferEntry,
+        dest_root: &Path,
+    ) -> Option<FuzzyCandidate> {
+        if self.options.fuzzy == 0 || entry.metadata.size == 0 {
+            return None;
+        }
+
+        let dest_path = if entry.relative_dest_path.as_os_str().is_empty() {
+            dest_root.to_path_buf()
+        } else {
+            dest_root.join(&entry.relative_dest_path)
+        };
+
+        let parent_dir = dest_path.parent()?;
+        if !parent_dir.is_dir() {
+            return None;
+        }
+
+        let target_fname = entry.relative_dest_path.file_name()?.to_str()?;
+        let target_suf = find_filename_suffix(target_fname);
+
+        let read_dir = fs::read_dir(parent_dir).ok()?;
+        let mut candidates = Vec::new();
+
+        for dir_entry in read_dir.flatten() {
+            let fname = match dir_entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if fname == target_fname || fname.starts_with(".ssync-tmp") || fname == ".~tmp~" {
+                continue;
+            }
+            let path = dir_entry.path();
+            let meta = match path.symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.file_type().is_file() || meta.len() == 0 {
+                continue;
+            }
+            let mtime_sec = meta.mtime();
+            candidates.push((fname, path, meta.len(), mtime_sec));
+        }
+
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Pass 1: exact size + mtime match
+        for (fname, path, size, mtime) in &candidates {
+            if *size == entry.metadata.size && *mtime == entry.metadata.mtime_sec {
+                return Some(FuzzyCandidate {
+                    filename: fname.clone(),
+                    full_path: path.clone(),
+                });
+            }
+        }
+
+        // Pass 2: Levenshtein distance scoring
+        let mut lowest_dist: u32 = 25 << 16;
+        let mut lowest_cand = None;
+
+        for (fname, path, _size, _mtime) in &candidates {
+            let suf = find_filename_suffix(fname);
+            let mut dist = fuzzy_distance(fname.as_bytes(), target_fname.as_bytes(), lowest_dist);
+            if dist < 0xFFFF_0000 {
+                let suf_dist = fuzzy_distance(suf.as_bytes(), target_suf.as_bytes(), 0xFFFF_0000);
+                dist = dist.saturating_add(suf_dist.saturating_mul(10));
+            }
+            if dist <= lowest_dist {
+                lowest_dist = dist;
+                lowest_cand = Some(FuzzyCandidate {
+                    filename: fname.clone(),
+                    full_path: path.clone(),
+                });
+            }
+        }
+
+        lowest_cand
     }
 
     /// Determines if two modification timestamps are considered identical according to `--modify-window`.
@@ -1356,6 +1567,36 @@ impl SyncEngine {
         }
 
         if needs_transfer {
+            let fuzzy_basis_path = if existing_dest_meta.is_none() && self.options.fuzzy > 0 {
+                let cand = self.find_fuzzy_candidate(entry, dest_root);
+                if let Some(ref c) = cand {
+                    let debug_on = self.options.debug.as_deref().is_some_and(|d| {
+                        let upper = d.to_uppercase();
+                        upper.contains("FUZZY") || upper.contains("ALL")
+                    });
+                    if debug_on {
+                        let rel_target = &entry.relative_dest_path;
+                        let rel_cand = if let Some(parent) = rel_target.parent() {
+                            if parent.as_os_str().is_empty() {
+                                PathBuf::from(&c.filename)
+                            } else {
+                                parent.join(&c.filename)
+                            }
+                        } else {
+                            PathBuf::from(&c.filename)
+                        };
+                        println!(
+                            "fuzzy basis selected for {}: {}",
+                            rel_target.display(),
+                            rel_cand.display()
+                        );
+                    }
+                }
+                cand.map(|c| c.full_path)
+            } else {
+                None
+            };
+
             if existing_dest_meta.is_some() {
                 if self.options.checksum {
                     itemize_char_content = 'c';
@@ -1377,7 +1618,12 @@ impl SyncEngine {
                 {
                     self.perform_append_transfer(entry, dest_path, total_stats)?;
                 } else if self.options.inplace {
-                    self.perform_inplace_transfer(entry, dest_path, total_stats)?;
+                    self.perform_inplace_transfer(
+                        entry,
+                        dest_path,
+                        fuzzy_basis_path.as_deref(),
+                        total_stats,
+                    )?;
                 } else if self.options.delay_updates {
                     self.perform_delay_updates_transfer(
                         entry,
@@ -1385,10 +1631,17 @@ impl SyncEngine {
                         dest_root,
                         delayed_updates,
                         delayed_staging_dirs,
+                        fuzzy_basis_path.as_deref(),
                         total_stats,
                     )?;
                 } else {
-                    self.perform_staged_transfer(entry, dest_path, dest_root, total_stats)?;
+                    self.perform_staged_transfer(
+                        entry,
+                        dest_path,
+                        dest_root,
+                        fuzzy_basis_path.as_deref(),
+                        total_stats,
+                    )?;
                 }
 
                 if !self.options.delay_updates {
@@ -1632,14 +1885,21 @@ impl SyncEngine {
         &self,
         entry: &TransferEntry,
         dest_path: &Path,
+        basis_path: Option<&Path>,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
-        let is_delta_mode = self.options.no_whole_file && dest_path.exists();
+        let basis_file = if dest_path.exists() {
+            Some(dest_path)
+        } else {
+            basis_path
+        };
+        let is_delta_mode =
+            (self.options.no_whole_file || basis_path.is_some()) && basis_file.is_some();
         let follow =
             self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
 
         if is_delta_mode {
-            let basis = fs::read(dest_path)?;
+            let basis = fs::read(basis_file.unwrap())?;
             let mut src_file =
                 safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
             let mut source = Vec::new();
@@ -1693,6 +1953,7 @@ impl SyncEngine {
         entry: &TransferEntry,
         dest_path: &Path,
         dest_root: &Path,
+        basis_path: Option<&Path>,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         let rand_id = std::time::SystemTime::now()
@@ -1706,12 +1967,18 @@ impl SyncEngine {
             parent.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id))
         };
 
-        let is_delta_mode = self.options.no_whole_file && dest_path.exists();
+        let basis_file = if dest_path.exists() {
+            Some(dest_path)
+        } else {
+            basis_path
+        };
+        let is_delta_mode =
+            (self.options.no_whole_file || basis_path.is_some()) && basis_file.is_some();
         let follow =
             self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
 
         if is_delta_mode {
-            let basis = fs::read(dest_path)?;
+            let basis = fs::read(basis_file.unwrap())?;
             let mut src_file =
                 safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
             let mut source = Vec::new();
@@ -1799,6 +2066,7 @@ impl SyncEngine {
         dest_root: &Path,
         delayed_updates: &mut Vec<(PathBuf, PathBuf)>,
         delayed_staging_dirs: &mut HashSet<PathBuf>,
+        basis_path: Option<&Path>,
         total_stats: &mut MatchStats,
     ) -> Result<(), FsError> {
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1809,32 +2077,73 @@ impl SyncEngine {
         let file_name = dest_path.file_name().unwrap();
         let staged_file = staging_dir.join(file_name);
 
+        let basis_file = if dest_path.exists() {
+            Some(dest_path)
+        } else {
+            basis_path
+        };
+        let is_delta_mode =
+            (self.options.no_whole_file || basis_path.is_some()) && basis_file.is_some();
         let follow =
             self.options.copy_links || self.options.copy_unsafe_links || self.options.copy_dirlinks;
-        let copied = if self.options.sparse {
-            safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow).and_then(
-                |mut src| {
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&staged_file)
-                        .and_then(|mut dst| copy_sparse(&mut src, &mut dst, entry.metadata.size))
-                },
-            )?
+
+        if is_delta_mode {
+            let basis = fs::read(basis_file.unwrap())?;
+            let mut src_file =
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
+            let mut source = Vec::new();
+            src_file.read_to_end(&mut source)?;
+            let sums = SumStruct::calculate(
+                basis.len() as u64,
+                self.options.block_size,
+                ChecksumAlgorithm::Md5,
+            );
+            let sigs = generate_basis_signatures(&basis, &sums, ChecksumAlgorithm::Md5, None);
+            let (tokens, stats) =
+                generate_delta(&source, &sigs, &sums, ChecksumAlgorithm::Md5, None, false);
+
+            total_stats.hash_hits += stats.hash_hits;
+            total_stats.false_alarms += stats.false_alarms;
+            total_stats.matches += stats.matches;
+            total_stats.literal_bytes += stats.literal_bytes;
+            total_stats.matched_bytes += stats.matched_bytes;
+
+            let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
+                .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
+
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&staged_file)?;
+            f.write_all(&reconstructed)?;
+            f.flush()?;
         } else {
-            safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow).and_then(
-                |mut src| {
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&staged_file)
-                        .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
-                },
-            )?
-        };
-        total_stats.literal_bytes += copied;
+            let copied = if self.options.sparse {
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)
+                    .and_then(|mut src| {
+                        OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&staged_file)
+                            .and_then(|mut dst| {
+                                copy_sparse(&mut src, &mut dst, entry.metadata.size)
+                            })
+                    })?
+            } else {
+                safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)
+                    .and_then(|mut src| {
+                        OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&staged_file)
+                            .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
+                    })?
+            };
+            total_stats.literal_bytes += copied;
+        }
 
         delayed_updates.push((staged_file, dest_path.to_path_buf()));
         Ok(())

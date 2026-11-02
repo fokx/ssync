@@ -1067,6 +1067,7 @@ fn main() {
         copy_unsafe_links: cli.copy_unsafe_links,
         safe_links: cli.safe_links,
         mkpath: cli.mkpath,
+        fuzzy: if cli.no_fuzzy { 0 } else { cli.fuzzy },
         filters,
         out_format: cli.out_format,
         human_readable: if cli.no_h { 0 } else { cli.human_readable },

@@ -462,3 +462,58 @@ fn test_backup_symlink_safe_links() {
         std::path::PathBuf::from("../../sensitive")
     );
 }
+
+#[test]
+fn test_fuzzy_basis_distance_and_selection() {
+    use ssync_fs::sync::{UNIT, find_filename_suffix, fuzzy_distance};
+
+    // 1. Suffix unit tests
+    assert_eq!(find_filename_suffix("archive-v2.tar"), ".tar");
+    assert_eq!(find_filename_suffix("foo.tar.gz"), ".gz");
+    assert_eq!(find_filename_suffix("backup.bak"), "");
+    assert_eq!(find_filename_suffix("old.orig"), "");
+    assert_eq!(find_filename_suffix("file.c~"), ".c");
+
+    // 2. Distance scoring unit tests
+    assert_eq!(fuzzy_distance(b"foo.tar", b"foo.tar", 25 << 16), 0);
+    let d1 = fuzzy_distance(b"archive-v1.tar", b"archive-v2.tar", 25 << 16);
+    let d2 = fuzzy_distance(b"archive-old.tar", b"archive-v2.tar", 25 << 16);
+    assert!(d1 < d2);
+    assert_eq!(d1, UNIT + 1); // |'1' - '2'| = 1
+
+    // 3. Integration sync with fuzzy basis
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let mut base_data = vec![0x42u8; 100_000];
+    base_data.extend_from_slice(b"new tail data added in v2");
+    fs::write(src.join("archive-v2.tar"), &base_data).unwrap();
+
+    // Destination has archive-v1.tar
+    let mut v1_data = vec![0x42u8; 100_000];
+    v1_data.extend_from_slice(b"older tail data");
+    fs::write(dest.join("archive-v1.tar"), &v1_data).unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        fuzzy: 1,
+        no_whole_file: true,
+        debug: Some("FUZZY".to_string()),
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // archive-v2.tar exists with correct content, archive-v1.tar remains
+    assert_eq!(fs::read(dest.join("archive-v2.tar")).unwrap(), base_data);
+    assert_eq!(fs::read(dest.join("archive-v1.tar")).unwrap(), v1_data);
+}

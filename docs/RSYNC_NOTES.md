@@ -377,3 +377,18 @@ Outputs an 11-character string describing each item's modification:
   - The sender must not follow symlinks flipped after the directory scan phase. Opening each source file is performed through held ancestor dirfds anchored at `source_root` with `O_NOFOLLOW`. Symlink following flags (`-L`, `-k`, `--copy-links`, `--copy-dirlinks`, `--copy-unsafe-links`) selectively allow following according to operator policy.
 - **Sparse File Preservation (`copy_sparse`)**:
   - Files containing sparse zero-filled regions are copied by scanning 8KiB blocks. Unmodified blocks of all zero bytes advance the output file pointer via `seek(SeekFrom::Current(n))`. The file length is finalized via `set_len(total_len)`, leaving unallocated sparse holes and matching rsync literal byte accounting.
+
+---
+
+## 8. Fuzzy Basis Matching & Distance Scoring (`--fuzzy`)
+
+- **Purpose**: When a file does not exist at destination under the source name, `--fuzzy` searches the destination directory for a similarly named file to use as the delta-transfer basis, avoiding a full retransfer.
+- **Algorithm** (`find_fuzzy` in `generator.c`, `fuzzy_distance` in `util1.c`):
+  1. Exact size + mtime match in the same destination directory is checked first.
+  2. If no exact match, candidate files in the same destination directory are scored using a custom Levenshtein edit distance scaled by `UNIT = 1 << 16`:
+     - Minor byte-difference costs (`abs(b1 - b2)`) are added to the unit edit cost.
+     - Filename suffixes (from last dot) are compared with 10x weighting (`dist += suffix_dist * 10`).
+     - Candidates with distance greater than `25 << 16` are rejected.
+  3. The closest candidate (`lowest_dist`) is chosen.
+  4. Diagnostic message emitted under `--debug=FUZZY`: `fuzzy basis selected for {target}: {candidate}`.
+  5. The basis is fed into the block signature and delta reconstructor; stale basis files are cleaned up by `--delete-delay` if deletion is active.
