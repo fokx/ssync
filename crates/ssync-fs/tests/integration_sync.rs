@@ -353,3 +353,59 @@ fn test_out_format_and_stats_execution() {
     assert!(dest.join("testfile.txt").is_file());
     assert_eq!(fs::read(dest.join("testfile.txt")).unwrap(), b"1234567890");
 }
+
+#[test]
+fn test_files_from_and_path_clamp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(src.join("d1/d2/d3")).unwrap();
+    fs::write(src.join("d1/f1"), b"f1").unwrap();
+    fs::write(src.join("d1/d2/d3/f3"), b"f3").unwrap();
+    fs::write(src.join("unlisted.txt"), b"unlisted").unwrap();
+    fs::write(src.join("file"), b"in-src-file").unwrap();
+    fs::write(src.join("keep"), b"in-src-keep").unwrap();
+
+    let list_content = "\
+# comment
+; semi-comment
+
+/file
+d1/f1
+d1/d2/d3/f3
+../keep
+";
+    let list_file = tmp.path().join("files.lst");
+    fs::write(&list_file, list_content).unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let src_path = SourcePath::from_raw(&format!("{}/", src.display()));
+    let entries = walker
+        .scan_files_from(&src_path, list_file.to_str().unwrap(), false)
+        .unwrap();
+
+    let sync_opts = SyncOptions {
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("file").is_file());
+    assert_eq!(fs::read(dest.join("file")).unwrap(), b"in-src-file");
+
+    assert!(dest.join("d1/f1").is_file());
+    assert_eq!(fs::read(dest.join("d1/f1")).unwrap(), b"f1");
+
+    assert!(dest.join("d1/d2/d3/f3").is_file());
+    assert_eq!(fs::read(dest.join("d1/d2/d3/f3")).unwrap(), b"f3");
+
+    assert!(dest.join("keep").is_file());
+    assert_eq!(fs::read(dest.join("keep")).unwrap(), b"in-src-keep");
+
+    assert!(!dest.join("unlisted.txt").exists());
+}

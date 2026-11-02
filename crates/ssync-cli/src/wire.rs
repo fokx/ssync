@@ -77,6 +77,7 @@ pub fn run_wire_client(
     times: bool,
     max_alloc: Option<&str>,
     remote_options: &[String],
+    files_from: Option<&str>,
     list_only: bool,
 ) -> Result<()> {
     // Determine remote side
@@ -143,6 +144,14 @@ pub fn run_wire_client(
         cmd.arg("--list-only");
     }
 
+    if let Some(ff) = files_from {
+        if let Some(stripped) = ff.strip_prefix(':') {
+            cmd.arg(format!("--files-from={}", stripped));
+        } else {
+            cmd.arg("--files-from=-");
+        }
+    }
+
     for opt in remote_options {
         cmd.arg(opt);
     }
@@ -190,7 +199,14 @@ pub fn run_wire_client(
 
     if is_sender {
         // Client is SENDER, remote server is RECEIVER
-        wire_send(sources_raw, &mut reader, &mut writer, false, itemize)?;
+        wire_send(
+            sources_raw,
+            &mut reader,
+            &mut writer,
+            false,
+            itemize,
+            files_from,
+        )?;
     } else {
         // Client is RECEIVER, remote server is SENDER
         let local_dest = Path::new(dest_raw.trim_end_matches('/'));
@@ -226,6 +242,7 @@ pub fn run_wire_server(
     itemize: bool,
     perms: bool,
     times: bool,
+    files_from: Option<&str>,
 ) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -276,7 +293,7 @@ pub fn run_wire_server(
         } else {
             &effective_paths[..]
         };
-        wire_send(targets, &mut reader, &mut writer, true, itemize)?;
+        wire_send(targets, &mut reader, &mut writer, true, itemize, files_from)?;
     } else {
         let target_dir = if effective_paths.len() > 1 {
             Path::new(&effective_paths[1])
@@ -315,6 +332,7 @@ fn wire_send<R: Read, W: Write>(
     writer: &mut MplexWriter<W>,
     _is_server: bool,
     _itemize: bool,
+    files_from: Option<&str>,
 ) -> Result<()> {
     // 1. Send empty filter list
     write_int(writer, 0)?;
@@ -329,7 +347,15 @@ fn wire_send<R: Read, W: Write>(
     };
     let walker = Walker::new(walk_opts);
     let source_paths: Vec<SourcePath> = sources.iter().map(|s| SourcePath::from_raw(s)).collect();
-    let transfer_entries = walker.scan_sources(&source_paths)?;
+    let transfer_entries = if let Some(ff) = files_from {
+        if !source_paths.is_empty() {
+            walker.scan_files_from(&source_paths[0], ff, false)?
+        } else {
+            walker.scan_sources(&source_paths)?
+        }
+    } else {
+        walker.scan_sources(&source_paths)?
+    };
 
     let mut entries = Vec::new();
     let mut file_payloads = Vec::new();

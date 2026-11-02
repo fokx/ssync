@@ -88,6 +88,146 @@ impl Walker {
         Ok(entries)
     }
 
+    /// Scans a file list according to `--files-from` (and optional `--from0`).
+    pub fn scan_files_from(
+        &self,
+        source: &SourcePath,
+        files_from: &str,
+        from0: bool,
+    ) -> Result<Vec<TransferEntry>, FsError> {
+        use std::io::Read;
+        let raw_data = if files_from == "-" {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(FsError::Io)?;
+            buf
+        } else {
+            fs::read(files_from).map_err(FsError::Io)?
+        };
+
+        let lines: Vec<String> = if from0 {
+            raw_data
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect()
+        } else {
+            let text = String::from_utf8_lossy(&raw_data);
+            text.lines().map(|s| s.to_string()).collect()
+        };
+
+        let mut entries = Vec::new();
+        let mut seen_dest_paths = HashSet::new();
+
+        // Record the root directory itself to synchronize its attributes
+        if seen_dest_paths.insert(PathBuf::from("")) {
+            if let Ok(meta) = self.read_meta(&source.path) {
+                entries.push(TransferEntry {
+                    source_path: source.path.clone(),
+                    source_root: Some(source.path.clone()),
+                    relative_dest_path: PathBuf::from(""),
+                    metadata: meta,
+                    is_implied_dir: false,
+                });
+            }
+        }
+
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            // Strip leading slashes
+            let unslashed = trimmed.trim_start_matches('/');
+
+            // Clamp ".." so it cannot escape source root
+            let mut parts = Vec::new();
+            for comp in unslashed.split('/') {
+                if comp.is_empty() || comp == "." {
+                    continue;
+                }
+                if comp == ".." {
+                    parts.pop();
+                } else {
+                    parts.push(comp);
+                }
+            }
+            if parts.is_empty() {
+                continue;
+            }
+
+            // Create implied parent directories
+            let mut cur_anc = PathBuf::new();
+            for comp in &parts[..parts.len() - 1] {
+                cur_anc.push(comp);
+                if seen_dest_paths.insert(cur_anc.clone()) {
+                    let anc_src = source.path.join(&cur_anc);
+                    let mut meta =
+                        FileMetadata::from_path(&anc_src, true).unwrap_or(FileMetadata {
+                            file_type: FileType::Directory,
+                            mode: 0o755,
+                            size: 0,
+                            mtime_sec: 0,
+                            mtime_nsec: 0,
+                            atime_sec: 0,
+                            atime_nsec: 0,
+                            uid: 0,
+                            gid: 0,
+                            dev: 0,
+                            ino: 0,
+                            nlink: 1,
+                            symlink_target: None,
+                        });
+                    meta.file_type = FileType::Directory;
+                    meta.symlink_target = None;
+                    entries.push(TransferEntry {
+                        source_path: anc_src,
+                        source_root: Some(source.path.clone()),
+                        relative_dest_path: cur_anc.clone(),
+                        metadata: meta,
+                        is_implied_dir: true,
+                    });
+                }
+            }
+
+            let rel_path = parts.join("/");
+            let rel_buf = PathBuf::from(&rel_path);
+            let item_src = source.path.join(&rel_path);
+
+            if seen_dest_paths.insert(rel_buf.clone()) {
+                match self.read_meta(&item_src) {
+                    Ok(meta) => {
+                        let is_dir = meta.file_type == FileType::Directory;
+                        entries.push(TransferEntry {
+                            source_path: item_src.clone(),
+                            source_root: Some(source.path.clone()),
+                            relative_dest_path: rel_buf.clone(),
+                            metadata: meta,
+                            is_implied_dir: false,
+                        });
+
+                        if is_dir && self.options.recursive {
+                            let dir_filters = self.options.filters.clone();
+                            self.scan_dir_contents(
+                                &item_src,
+                                Some(&source.path),
+                                &rel_buf,
+                                &dir_filters,
+                                &mut entries,
+                                &mut seen_dest_paths,
+                            )?;
+                        }
+                    }
+                    Err(FsError::PartialTransfer) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     fn scan_single_source(
         &self,
         source: &SourcePath,

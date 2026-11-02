@@ -447,6 +447,14 @@ struct Cli {
     #[arg(long = "drop-dirlinks")]
     drop_dirlinks: bool,
 
+    /// Read list of source-file names from FILE
+    #[arg(long = "files-from")]
+    files_from: Option<String>,
+
+    /// Read list of file names delimited by NUL
+    #[arg(short = '0', long = "from0")]
+    from0: bool,
+
     /// Write batch file
     #[arg(long = "write-batch")]
     write_batch: Option<String>,
@@ -801,6 +809,7 @@ fn main() {
             cli.itemize_changes > 0,
             cli.perms || cli.archive,
             cli.times || cli.archive,
+            cli.files_from.as_deref(),
         ) {
             eprintln!("ssync [server]: {:#}", e);
             process::exit(1);
@@ -844,6 +853,7 @@ fn main() {
             cli.times || cli.archive,
             cli.max_alloc.as_deref(),
             &cli.remote_option,
+            cli.files_from.as_deref(),
             cli.list_only,
         ) {
             eprintln!("ssync [client]: {:#}", e);
@@ -929,11 +939,25 @@ fn main() {
     };
 
     let walker = Walker::new(walk_opts);
-    let mut entries = match walker.scan_sources(&sources) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("ssync: error scanning sources: {}", e);
-            process::exit(11);
+    let mut entries = if let Some(ref ff) = cli.files_from {
+        if sources.is_empty() {
+            eprintln!("ssync: missing source directory for --files-from");
+            process::exit(1);
+        }
+        match walker.scan_files_from(&sources[0], ff, cli.from0) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("ssync: error reading --files-from: {}", e);
+                process::exit(11);
+            }
+        }
+    } else {
+        match walker.scan_sources(&sources) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("ssync: error scanning sources: {}", e);
+                process::exit(11);
+            }
         }
     };
     let scan_had_error = walker.had_error();
