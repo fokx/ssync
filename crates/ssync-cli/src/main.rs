@@ -767,7 +767,12 @@ fn main() {
     let dest_raw = cli.paths.last().unwrap();
     let sources_raw = &cli.paths[..cli.paths.len() - 1];
 
-    let dest_path = PathBuf::from(dest_raw.trim_end_matches('/'));
+    let mut dest_path = PathBuf::from(dest_raw.trim_end_matches('/'));
+    if dest_path.is_dir() && dest_path.is_symlink() {
+        if let Ok(resolved) = dest_path.canonicalize() {
+            dest_path = resolved;
+        }
+    }
     let sources: Vec<SourcePath> = sources_raw
         .iter()
         .map(|s| SourcePath::from_raw(s))

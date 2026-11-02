@@ -290,3 +290,36 @@ fn test_keep_dirlinks_and_symlinked_parent() {
         b"through symlink"
     );
 }
+
+#[test]
+fn test_dest_symlinked_dir_follows_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let real = tmp.path().join("realdest");
+    let link = tmp.path().join("backup");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&real).unwrap();
+    fs::write(src.join("f.txt"), b"content\n").unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        preserve_times: true,
+        preserve_perms: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &link).unwrap();
+
+    assert!(link.is_symlink(), "backup should remain a symlink");
+    assert!(real.join("f.txt").is_file(), "file must land in realdest");
+    assert_eq!(fs::read(real.join("f.txt")).unwrap(), b"content\n");
+}

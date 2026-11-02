@@ -310,6 +310,17 @@ impl SyncEngine {
 
     /// Executes the synchronization of entries into `dest_root`.
     pub fn execute(&self, entries: &[TransferEntry], dest_root: &Path) -> Result<(), FsError> {
+        let resolved_root;
+        let dest_root = if dest_root.is_dir() && dest_root.is_symlink() {
+            if let Ok(canon) = dest_root.canonicalize() {
+                resolved_root = canon;
+                &resolved_root
+            } else {
+                dest_root
+            }
+        } else {
+            dest_root
+        };
         let dest_existed = dest_root.exists();
         if self.options.dest_is_file {
             let parent = dest_root.parent().unwrap_or_else(|| Path::new(""));
@@ -549,7 +560,7 @@ impl SyncEngine {
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
-        if is_dest_symlink && !self.options.keep_dirlinks && !self.options.dry_run {
+        if !is_root && is_dest_symlink && !self.options.keep_dirlinks && !self.options.dry_run {
             let _ = fs::remove_file(dest_path);
         }
 
