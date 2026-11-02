@@ -422,7 +422,7 @@ impl Walker {
         }
     }
 
-    fn is_unsafe_symlink(rel_dest: &Path, target: &Path) -> bool {
+    pub fn is_unsafe_symlink(rel_dest: &Path, target: &Path) -> bool {
         let target_str = target.to_string_lossy();
         if target_str.is_empty() || target_str.starts_with('/') {
             return true;

@@ -1065,6 +1065,7 @@ fn main() {
         copy_dirlinks: cli.copy_dirlinks,
         keep_dirlinks: cli.keep_dirlinks,
         copy_unsafe_links: cli.copy_unsafe_links,
+        safe_links: cli.safe_links,
         mkpath: cli.mkpath,
         filters,
         out_format: cli.out_format,

@@ -409,3 +409,56 @@ d1/d2/d3/f3
 
     assert!(!dest.join("unlisted.txt").exists());
 }
+
+#[test]
+fn test_backup_symlink_safe_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(src.join("escape"), b"replacement").unwrap();
+    std::os::unix::fs::symlink("../../sensitive", dest.join("escape")).unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    // 1. With safe_links: unsafe symlink is dropped from backup
+    let sync_opts = SyncOptions {
+        backup: true,
+        suffix: ".bak".to_string(),
+        safe_links: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(!dest.join("escape.bak").exists());
+    assert!(dest.join("escape").is_file());
+
+    // 2. Without safe_links: unsafe symlink is backed up
+    fs::remove_file(dest.join("escape")).unwrap();
+    std::os::unix::fs::symlink("../../sensitive", dest.join("escape")).unwrap();
+
+    let sync_opts2 = SyncOptions {
+        backup: true,
+        suffix: ".bak".to_string(),
+        safe_links: false,
+        ..Default::default()
+    };
+    let engine2 = SyncEngine::new(sync_opts2);
+    engine2.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("escape.bak").is_symlink());
+    assert_eq!(
+        fs::read_link(dest.join("escape.bak")).unwrap(),
+        std::path::PathBuf::from("../../sensitive")
+    );
+}

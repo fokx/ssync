@@ -80,6 +80,7 @@ pub struct SyncOptions {
     pub copy_dirlinks: bool,
     pub keep_dirlinks: bool,
     pub copy_unsafe_links: bool,
+    pub safe_links: bool,
     pub mkpath: bool,
     pub filters: FilterSet,
     pub out_format: Option<String>,
@@ -978,8 +979,20 @@ impl SyncEngine {
         dest_root: &Path,
         is_delete: bool,
     ) -> Result<(), FsError> {
-        if !dest_path.exists() {
-            return Ok(());
+        let sym_meta = match dest_path.symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+
+        let is_symlink = sym_meta.file_type().is_symlink();
+        if is_symlink {
+            if let Ok(link_target) = fs::read_link(dest_path) {
+                if self.options.safe_links
+                    && crate::walker::Walker::is_unsafe_symlink(rel_path, &link_target)
+                {
+                    return Ok(());
+                }
+            }
         }
 
         let suffix = if self.options.suffix.is_empty() {
@@ -1003,8 +1016,8 @@ impl SyncEngine {
             let _ = safe_create_dir_all(dest_root, parent);
         }
 
-        if backup_dest.exists() {
-            if backup_dest.is_dir() {
+        if backup_dest.symlink_metadata().is_ok() {
+            if backup_dest.is_dir() && !backup_dest.is_symlink() {
                 let _ = fs::remove_dir_all(&backup_dest);
             } else {
                 let _ = fs::remove_file(&backup_dest);
@@ -1015,6 +1028,10 @@ impl SyncEngine {
 
         if is_delete {
             fs::rename(dest_path, &backup_dest)?;
+        } else if is_symlink {
+            if let Ok(target) = fs::read_link(dest_path) {
+                std::os::unix::fs::symlink(&target, &backup_dest)?;
+            }
         } else {
             fs::copy(dest_path, &backup_dest)?;
         }
