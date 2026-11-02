@@ -122,7 +122,7 @@ impl Walker {
 
         // Record the root directory itself to synchronize its attributes
         if seen_dest_paths.insert(PathBuf::from("")) {
-            if let Ok(meta) = self.read_meta(&source.path) {
+            if let Ok(meta) = self.read_meta(&source.path, source.has_trailing_slash) {
                 entries.push(TransferEntry {
                     source_path: source.path.clone(),
                     source_root: Some(source.path.clone()),
@@ -196,7 +196,7 @@ impl Walker {
             let item_src = source.path.join(&rel_path);
 
             if seen_dest_paths.insert(rel_buf.clone()) {
-                match self.read_meta(&item_src) {
+                match self.read_meta(&item_src, false) {
                     Ok(meta) => {
                         let is_dir = meta.file_type == FileType::Directory;
                         entries.push(TransferEntry {
@@ -257,7 +257,7 @@ impl Walker {
             // Check if there is an explicit anchor (starts with "./" or contains "/./")
             if let Some(anc) = source.anchor_path() {
                 if seen_dest_paths.insert(PathBuf::from("")) {
-                    if let Ok(meta) = self.read_meta(&anc) {
+                    if let Ok(meta) = self.read_meta(&anc, true) {
                         entries.push(TransferEntry {
                             source_path: anc,
                             source_root: Some(source_root.clone()),
@@ -324,7 +324,7 @@ impl Walker {
             )?;
         } else {
             // Non-relative traversal
-            let meta = match self.read_meta(&source.path) {
+            let meta = match self.read_meta(&source.path, source.has_trailing_slash) {
                 Ok(m) => m,
                 Err(FsError::PartialTransfer) => return Ok(()),
                 Err(e) => return Err(e),
@@ -391,7 +391,7 @@ impl Walker {
         Ok(())
     }
 
-    fn read_meta(&self, path: &Path) -> Result<FileMetadata, FsError> {
+    fn read_meta(&self, path: &Path, follow_if_dir: bool) -> Result<FileMetadata, FsError> {
         if self.options.copy_links {
             match FileMetadata::from_path(path, true) {
                 Ok(meta) => Ok(meta),
@@ -407,7 +407,7 @@ impl Walker {
                     Err(e)
                 }
             }
-        } else if self.options.copy_dirlinks {
+        } else if self.options.copy_dirlinks || follow_if_dir {
             let direct = FileMetadata::from_path(path, false)?;
             if direct.file_type == FileType::Symlink {
                 if let Ok(target_meta) = FileMetadata::from_path(path, true) {
@@ -459,7 +459,7 @@ impl Walker {
         entries: &mut Vec<TransferEntry>,
         seen_dest_paths: &mut HashSet<PathBuf>,
     ) -> Result<(), FsError> {
-        let mut meta = match self.read_meta(src) {
+        let mut meta = match self.read_meta(src, false) {
             Ok(m) => m,
             Err(FsError::PartialTransfer) => return Ok(()),
             Err(e) => return Err(e),
@@ -589,7 +589,7 @@ impl Walker {
 
         for entry in fs::read_dir(dir_path)? {
             let p = entry?.path();
-            let is_dir = match self.read_meta(&p) {
+            let is_dir = match self.read_meta(&p, self.options.copy_dirlinks) {
                 Ok(m) => m.file_type == FileType::Directory,
                 Err(_) => false,
             };

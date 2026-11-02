@@ -640,3 +640,35 @@ fn test_inplace_protected_regular_reopen() {
         b"new updated content\n"
     );
 }
+
+#[test]
+fn test_walker_relative_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("base");
+    let deep = base.join("sub").join("deep");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("f2"), b"DEEP\n").unwrap();
+
+    let orig_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&base).unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        relative: true,
+        ..Default::default()
+    });
+
+    let sources = vec![SourcePath::from_raw("sub/deep/f2")];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    std::env::set_current_dir(orig_dir).unwrap();
+
+    // Walker must emit intermediate directories leading up to cut path
+    let rel_paths: Vec<String> = entries
+        .iter()
+        .map(|e| e.relative_dest_path.to_string_lossy().to_string())
+        .collect();
+    assert!(rel_paths.contains(&"sub/deep/f2".to_string()));
+    assert!(rel_paths.contains(&"sub/deep".to_string()));
+    assert!(rel_paths.contains(&"sub".to_string()));
+}

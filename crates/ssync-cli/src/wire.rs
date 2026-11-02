@@ -18,6 +18,7 @@ use ssync_proto::varint::{read_int, write_int};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -90,6 +91,7 @@ pub fn run_wire_client(
     link_dest: &[String],
     copy_dest: &[String],
     compare_dest: &[String],
+    relative: bool,
 ) -> Result<()> {
     // Determine remote side
     let dest_remote = parse_remote_path(dest_raw);
@@ -142,6 +144,9 @@ pub fn run_wire_client(
         opts_str.push('s');
     }
     opts_str.push_str("lptgoDr");
+    if relative {
+        opts_str.push('R');
+    }
     if itemize {
         opts_str.push('i');
     }
@@ -251,6 +256,8 @@ pub fn run_wire_client(
             false,
             itemize,
             files_from,
+            list_only,
+            relative,
         )?;
     } else {
         // Client is RECEIVER, remote server is SENDER
@@ -258,6 +265,7 @@ pub fn run_wire_client(
         let bd_path = backup_dir.map(Path::new);
         wire_recv(
             local_dest,
+            dest_raw,
             &mut reader,
             &mut writer,
             false,
@@ -269,6 +277,7 @@ pub fn run_wire_client(
             backup,
             bd_path,
             "~",
+            link_dest,
         )?;
     }
 
@@ -296,6 +305,9 @@ pub fn run_wire_server(
     backup: bool,
     backup_dir: Option<PathBuf>,
     suffix: String,
+    list_only: bool,
+    relative: bool,
+    link_dest: &[String],
 ) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -346,15 +358,25 @@ pub fn run_wire_server(
         } else {
             &effective_paths[..]
         };
-        wire_send(targets, &mut reader, &mut writer, true, itemize, files_from)?;
+        wire_send(
+            targets,
+            &mut reader,
+            &mut writer,
+            true,
+            itemize,
+            files_from,
+            list_only,
+            relative,
+        )?;
     } else {
-        let target_dir = if effective_paths.len() > 1 {
-            Path::new(&effective_paths[1])
+        let (target_dir, dest_raw) = if effective_paths.len() > 1 {
+            (Path::new(&effective_paths[1]), effective_paths[1].as_str())
         } else {
-            Path::new(".")
+            (Path::new("."), ".")
         };
         wire_recv(
             target_dir,
+            dest_raw,
             &mut reader,
             &mut writer,
             true,
@@ -366,6 +388,7 @@ pub fn run_wire_server(
             backup,
             backup_dir.as_deref(),
             &suffix,
+            link_dest,
         )?;
     }
 
@@ -389,6 +412,8 @@ fn wire_send<R: Read, W: Write>(
     _is_server: bool,
     _itemize: bool,
     files_from: Option<&str>,
+    list_only: bool,
+    relative: bool,
 ) -> Result<()> {
     // 1. Send empty filter list
     write_int(writer, 0)?;
@@ -399,6 +424,7 @@ fn wire_send<R: Read, W: Write>(
         recursive: true,
         dirs: true,
         links: true,
+        relative,
         ..Default::default()
     };
     let walker = Walker::new(walk_opts);
@@ -428,9 +454,13 @@ fn wire_send<R: Read, W: Write>(
         };
 
         let raw_mode = match te.metadata.file_type {
-            FileType::Directory => 0o040000 | te.metadata.mode,
-            FileType::Symlink => 0o120000 | te.metadata.mode,
-            _ => 0o100000 | te.metadata.mode,
+            FileType::Directory => 0o040000 | (te.metadata.mode & 0o7777),
+            FileType::Symlink => 0o120000 | (te.metadata.mode & 0o7777),
+            FileType::Fifo => 0o010000 | (te.metadata.mode & 0o7777),
+            FileType::Socket => 0o140000 | (te.metadata.mode & 0o7777),
+            FileType::BlockDevice => 0o060000 | (te.metadata.mode & 0o7777),
+            FileType::CharDevice => 0o020000 | (te.metadata.mode & 0o7777),
+            _ => 0o100000 | (te.metadata.mode & 0o7777),
         };
 
         entries.push(WireFileEntry {
@@ -454,6 +484,10 @@ fn wire_send<R: Read, W: Write>(
 
     // Send file list
     send_wire_file_list(writer, &entries)?;
+
+    if list_only {
+        return Ok(());
+    }
 
     // Transfer regular files
     for (_entry, content_opt) in entries.iter().zip(file_payloads.iter()) {
@@ -526,6 +560,7 @@ fn collect_dest_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 #[allow(clippy::too_many_arguments)]
 fn wire_recv<R: Read, W: Write>(
     dest_dir: &Path,
+    dest_raw: &str,
     reader: &mut MplexReader<R>,
     writer: &mut MplexWriter<W>,
     is_server: bool,
@@ -537,6 +572,7 @@ fn wire_recv<R: Read, W: Write>(
     backup: bool,
     backup_dir: Option<&Path>,
     suffix: &str,
+    link_dest: &[String],
 ) -> Result<()> {
     // 1. Read filter list (0 means empty)
     let filter_len = read_int(reader)?;
@@ -569,7 +605,12 @@ fn wire_recv<R: Read, W: Write>(
         return Ok(());
     }
 
-    if !dest_dir.exists() {
+    let dest_is_file = !dest_dir.is_dir()
+        && !dest_raw.ends_with('/')
+        && entries.len() == 1
+        && (entries[0].mode & 0o170000) != 0o040000;
+
+    if !dest_is_file && !dest_dir.exists() {
         fs::create_dir_all(dest_dir)?;
     }
 
@@ -614,7 +655,7 @@ fn wire_recv<R: Read, W: Write>(
     // 3. Process each entry
     for entry in &entries {
         let is_root = entry.name.is_empty() || entry.name == ".";
-        let target_path = if is_root {
+        let target_path = if is_root || dest_is_file {
             dest_dir.to_path_buf()
         } else if dest_dir.is_dir() {
             dest_dir.join(&entry.name)
@@ -666,10 +707,40 @@ fn wire_recv<R: Read, W: Write>(
                 let _ = fs_meta.apply_to(&target_path, perms, times, false, false);
             }
             continue;
+        } else if file_type == 0o010000 {
+            // FIFO / named pipe
+            if let Some(parent) = target_path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            if target_path.exists() || target_path.is_symlink() {
+                let _ = fs::remove_file(&target_path);
+            }
+            let c_path = std::ffi::CString::new(target_path.as_os_str().as_bytes()).unwrap();
+            unsafe {
+                libc::mkfifo(c_path.as_ptr(), (entry.mode & 0o777) as libc::mode_t);
+            }
+            if itemize {
+                report_info(is_server, writer, &format!("cS+++++++++ {}\n", entry.name))?;
+            }
+            if let Ok(mut fs_meta) = FileMetadata::from_path(&target_path, false) {
+                if perms {
+                    fs_meta.mode = entry.mode;
+                }
+                if times {
+                    fs_meta.mtime_sec = entry.mtime_secs;
+                    fs_meta.mtime_nsec = entry.mtime_nanos as i64;
+                }
+                let _ = fs_meta.apply_to(&target_path, perms, times, false, false);
+            }
+            continue;
         } else {
             // Regular file
             if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)?;
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
             }
 
             if backup && target_path.exists() {
@@ -690,6 +761,30 @@ fn wire_recv<R: Read, W: Write>(
                         e
                     );
                     bail!("backup to {} failed: {}", bak_path.display(), e);
+                }
+            }
+
+            // Check --link-dest candidates if target_path does not exist
+            if !target_path.exists() && !link_dest.is_empty() {
+                for ldir in link_dest {
+                    let full_dir = if ldir.starts_with('/') {
+                        PathBuf::from(ldir)
+                    } else if dest_dir.join(ldir).exists() {
+                        dest_dir.join(ldir)
+                    } else {
+                        PathBuf::from(ldir)
+                    };
+                    let cand = if is_root || dest_is_file {
+                        full_dir.join(target_path.file_name().unwrap_or_default())
+                    } else {
+                        full_dir.join(&entry.name)
+                    };
+                    if let Ok(meta) = cand.symlink_metadata() {
+                        if meta.is_file() && meta.len() == entry.size {
+                            let _ = fs::hard_link(&cand, &target_path);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -722,7 +817,10 @@ fn wire_recv<R: Read, W: Write>(
                     bail!("MD5 mismatch for file: {}", entry.name);
                 }
 
-                fs::write(&target_path, &reconstructed)?;
+                if reconstructed != basis {
+                    let _ = fs::remove_file(&target_path);
+                    fs::write(&target_path, &reconstructed)?;
+                }
             } else {
                 let sum_struct = SumStruct {
                     file_len: 0,
@@ -834,5 +932,15 @@ mod tests {
         assert_eq!(safe_arg("plain_path", false), "plain_path");
         assert_eq!(safe_arg("path with spaces", false), "path\\ with\\ spaces");
         assert_eq!(safe_arg("path with spaces", true), "path with spaces");
+    }
+
+    #[test]
+    fn test_file_type_mode_encoding() {
+        let entry_reg = 0o100000 | 0o644;
+        let entry_dir = 0o040000 | 0o755;
+        let entry_fifo = 0o010000 | 0o644;
+        assert_eq!(entry_reg & 0o170000, 0o100000);
+        assert_eq!(entry_dir & 0o170000, 0o040000);
+        assert_eq!(entry_fifo & 0o170000, 0o010000);
     }
 }

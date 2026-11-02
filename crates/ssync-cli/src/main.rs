@@ -840,6 +840,9 @@ fn main() {
             cli.backup,
             backup_dir,
             suffix,
+            cli.list_only,
+            cli.relative,
+            &cli.link_dest,
         ) {
             eprintln!("ssync [server]: {:#}", e);
             process::exit(1);
@@ -896,6 +899,7 @@ fn main() {
             &cli.link_dest,
             &cli.copy_dest,
             &cli.compare_dest,
+            cli.relative,
         ) {
             eprintln!("ssync [client]: {:#}", e);
             process::exit(1);
