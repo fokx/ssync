@@ -96,10 +96,20 @@ pub fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
+fn is_c_locale() -> bool {
+    std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LC_CTYPE"))
+        .or_else(|_| std::env::var("LANG"))
+        .map(|v| v == "C" || v == "POSIX")
+        .unwrap_or(false)
+}
+
 /// Formats a filename for terminal output, escaping C0/C1 control characters and DEL as `\#NNN`.
-pub fn format_terminal_filename(raw: &[u8]) -> String {
+/// When `eight_bit` is true (or not in C locale for non-control high bytes), high-bit characters are left raw.
+pub fn format_terminal_filename(raw: &[u8], eight_bit: bool) -> String {
     let mut out = Vec::new();
     let mut i = 0;
+    let c_locale = is_c_locale();
     while i < raw.len() {
         let b = raw[i];
 
@@ -111,6 +121,12 @@ pub fn format_terminal_filename(raw: &[u8]) -> String {
             && raw[i + 4].is_ascii_digit()
         {
             out.extend_from_slice(b"\\#134");
+            i += 1;
+            continue;
+        }
+
+        if !eight_bit && c_locale && b >= 0x80 {
+            out.extend_from_slice(format!("\\#{:03o}", b).as_bytes());
             i += 1;
             continue;
         }
@@ -195,23 +211,23 @@ mod tests {
     #[test]
     fn test_terminal_filename_escaping() {
         assert_eq!(
-            format_terminal_filename(b"raw_\x9b_name"),
+            format_terminal_filename(b"raw_\x9b_name", false),
             "raw_\\#233_name"
         );
         assert_eq!(
-            format_terminal_filename(b"utf8_\xc2\x9b_name"),
+            format_terminal_filename(b"utf8_\xc2\x9b_name", false),
             "utf8_\\#302\\#233_name"
         );
         assert_eq!(
-            format_terminal_filename(b"\rleading_cr_name"),
+            format_terminal_filename(b"\rleading_cr_name", false),
             "\\#015leading_cr_name"
         );
         assert_eq!(
-            format_terminal_filename(b"delete_\x7f_name"),
+            format_terminal_filename(b"delete_\x7f_name", false),
             "delete_\\#177_name"
         );
         assert_eq!(
-            format_terminal_filename(b"valid_\xd8\x9b_name"),
+            format_terminal_filename(b"valid_\xd8\x9b_name", false),
             "valid_\u{061b}_name"
         );
     }

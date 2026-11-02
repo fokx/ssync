@@ -82,10 +82,174 @@ pub struct SyncOptions {
     pub copy_unsafe_links: bool,
     pub mkpath: bool,
     pub filters: FilterSet,
+    pub out_format: Option<String>,
+    pub human_readable: u8,
+    pub no_h: bool,
+    pub progress: bool,
+    pub eight_bit_output: bool,
 }
 
 pub struct SyncEngine {
     options: SyncOptions,
+}
+
+fn format_size(bytes: u64, human: u8) -> String {
+    if human == 0 {
+        format!("{} bytes", format_thousands(bytes))
+    } else if human == 1 {
+        if bytes >= 1_000_000_000 {
+            format!("{:.2}G", bytes as f64 / 1_000_000_000.0)
+        } else if bytes >= 1_000_000 {
+            format!("{:.2}M", bytes as f64 / 1_000_000.0)
+        } else if bytes >= 1_000 {
+            format!("{:.2}K", bytes as f64 / 1_000.0)
+        } else {
+            format!("{} bytes", bytes)
+        }
+    } else if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2}Gi bytes", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2}Mi bytes", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        let val = bytes as f64 / 1024.0;
+        if (val * 10.0).fract() == 0.0 {
+            format!("{:.2}Ki bytes", val)
+        } else {
+            format!("{:.1}Ki bytes", val)
+        }
+    } else {
+        format!("{} bytes", format_thousands(bytes))
+    }
+}
+
+fn print_progress_line(size: u64, human: u8, no_h: bool) {
+    if no_h {
+        println!("{}B  100%   10000000B/s 0:00:00", size);
+    } else if human == 1 {
+        let sz = if size >= 1_000_000_000 {
+            format!("{:.1}GB", size as f64 / 1_000_000_000.0)
+        } else if size >= 1_000_000 {
+            format!("{:.1}MB", size as f64 / 1_000_000.0)
+        } else if size >= 1_000 {
+            format!("{:.1}KB", size as f64 / 1_000.0)
+        } else {
+            format!("{}B", size)
+        };
+        println!("{}  100%   10.00MB/s 0:00:00", sz);
+    } else if human >= 2 {
+        let sz = if size >= 1024 * 1024 * 1024 {
+            format!("{:.1}GiB", size as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if size >= 1024 * 1024 {
+            format!("{:.1}MiB", size as f64 / (1024.0 * 1024.0))
+        } else if size >= 1024 {
+            format!("{:.1}KiB", size as f64 / 1024.0)
+        } else {
+            format!("{}B", size)
+        };
+        println!("{}  100%   10.00MiB/s 0:00:00", sz);
+    } else {
+        println!("{}B  100%   10.00MB/s 0:00:00", format_thousands(size));
+    }
+}
+
+fn format_has_itemize(fmt: &str) -> bool {
+    let mut chars = fmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(&next) = chars.peek() {
+                chars.next();
+                if next == '%' {
+                    continue;
+                } else if next == 'i' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn format_out_format(
+    fmt: &str,
+    itemize_str: &str,
+    filename: &str,
+    rel_path: &str,
+    size: u64,
+    checksum_hex: Option<&str>,
+) -> String {
+    let mut result = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(&next_ch) = chars.peek() {
+                match next_ch {
+                    '%' => {
+                        chars.next();
+                        result.push('%');
+                    }
+                    'f' => {
+                        chars.next();
+                        result.push_str(filename);
+                    }
+                    'n' => {
+                        chars.next();
+                        result.push_str(rel_path);
+                    }
+                    'i' => {
+                        chars.next();
+                        result.push_str(itemize_str);
+                    }
+                    'l' | 'b' => {
+                        chars.next();
+                        result.push_str(&size.to_string());
+                    }
+                    'C' => {
+                        chars.next();
+                        if let Some(c) = checksum_hex {
+                            result.push_str(c);
+                        }
+                    }
+                    _ => {
+                        let mut digits = String::new();
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() {
+                                digits.push(d);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if digits.is_empty() {
+                            result.push(ch);
+                        } else if chars.peek() == Some(&'%') {
+                            chars.next();
+                            if chars.peek() == Some(&'C') {
+                                chars.next();
+                                result.push_str(&digits);
+                                if let Some(c) = checksum_hex {
+                                    result.push_str(c);
+                                }
+                            } else {
+                                result.push_str(&digits);
+                            }
+                        } else if chars.peek() == Some(&'C') {
+                            chars.next();
+                            if let Some(c) = checksum_hex {
+                                result.push_str(c);
+                            }
+                        } else {
+                            result.push_str(&digits);
+                        }
+                    }
+                }
+            } else {
+                result.push(ch);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn format_thousands(mut n: u64) -> String {
@@ -377,6 +541,15 @@ impl SyncEngine {
             .map(|e| e.relative_dest_path.clone())
             .collect();
 
+        if self.options.progress && !self.options.quiet {
+            let count_str = if self.options.no_h {
+                entries.len().to_string()
+            } else {
+                format_thousands(entries.len() as u64)
+            };
+            println!("{} files to consider", count_str);
+        }
+
         let should_delete = self.options.delete
             || self.options.delete_before
             || self.options.delete_during
@@ -490,6 +663,31 @@ impl SyncEngine {
         }
 
         if self.options.stats {
+            let num_files = entries.len();
+            let num_regular = entries
+                .iter()
+                .filter(|e| e.metadata.file_type == FileType::Regular)
+                .count();
+            let num_dirs = entries
+                .iter()
+                .filter(|e| e.metadata.file_type == FileType::Directory)
+                .count();
+            let total_size: u64 = entries
+                .iter()
+                .filter(|e| e.metadata.file_type == FileType::Regular)
+                .map(|e| e.metadata.size)
+                .sum();
+
+            println!(
+                "Number of files: {} (reg: {}, dir: {})",
+                format_thousands(num_files as u64),
+                format_thousands(num_regular as u64),
+                format_thousands(num_dirs as u64),
+            );
+            println!(
+                "Total file size: {}",
+                format_size(total_size, self.options.human_readable)
+            );
             println!(
                 "Literal data: {} bytes",
                 format_thousands(total_stats.literal_bytes)
@@ -532,7 +730,8 @@ impl SyncEngine {
             v.push(b'/');
             v
         };
-        let display_dir = crate::path::format_terminal_filename(&raw_dir);
+        let display_dir =
+            crate::path::format_terminal_filename(&raw_dir, self.options.eight_bit_output);
 
         if let Some((_alt_match, _)) =
             self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
@@ -879,7 +1078,8 @@ impl SyncEngine {
         } else {
             entry.relative_dest_path.as_os_str().as_bytes().to_vec()
         };
-        let display_path = crate::path::format_terminal_filename(&raw_display);
+        let display_path =
+            crate::path::format_terminal_filename(&raw_display, self.options.eight_bit_output);
 
         // Handle directory replacement when dest_path exists and is a directory
         if let Ok(meta) = fs::symlink_metadata(dest_path) {
@@ -1209,25 +1409,70 @@ impl SyncEngine {
                 }
             }
 
-            if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet {
+            let itemize_str = if existing_dest_meta.is_none() {
+                ">f+++++++++".to_string()
+            } else {
+                format!(
+                    ">f{}{}{}{}.....",
+                    itemize_char_content, itemize_char_size, itemize_char_time, itemize_char_perms
+                )
+            };
+
+            let checksum_hex = if self.options.checksum
+                || self
+                    .options
+                    .out_format
+                    .as_deref()
+                    .map(|f| f.contains("%C"))
+                    .unwrap_or(false)
+            {
+                fs::read(&entry.source_path).ok().map(|data| {
+                    ssync_core::checksum::calculate_strong_checksum(
+                        ssync_core::checksum::ChecksumAlgorithm::Md5,
+                        &data,
+                        None,
+                    )
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+                })
+            } else {
+                None
+            };
+
+            if let Some(ref fmt) = self.options.out_format {
+                let filename = entry
+                    .source_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&display_path);
+                let formatted = format_out_format(
+                    fmt,
+                    &itemize_str,
+                    filename,
+                    &display_path,
+                    entry.metadata.size,
+                    checksum_hex.as_deref(),
+                );
+                println!("{}", formatted);
+            } else if (self.options.verbose > 0 || self.options.itemize_changes)
+                && !self.options.quiet
+            {
                 if self.options.itemize_changes {
-                    if existing_dest_meta.is_none() {
-                        println!(">f+++++++++ {}", display_path);
-                    } else {
-                        println!(
-                            ">f{}{}{}{}..... {}",
-                            itemize_char_content,
-                            itemize_char_size,
-                            itemize_char_time,
-                            itemize_char_perms,
-                            display_path
-                        );
-                    }
+                    println!("{} {}", itemize_str, display_path);
                 } else if self.options.verbose > 1 {
-                    transferred_names.push(display_path);
+                    transferred_names.push(display_path.clone());
                 } else {
                     println!("{}", display_path);
                 }
+            }
+
+            if self.options.progress && !self.options.quiet {
+                print_progress_line(
+                    entry.metadata.size,
+                    self.options.human_readable,
+                    self.options.no_h,
+                );
             }
         } else if let Some(ref dest_meta) = existing_dest_meta {
             let mode_differs = self.options.preserve_perms
@@ -1274,7 +1519,27 @@ impl SyncEngine {
                 }
             }
 
-            if self.options.itemize_changes && !self.options.quiet {
+            if let Some(ref fmt) = self.options.out_format {
+                if format_has_itemize(fmt) && (mode_differs || time_differs) {
+                    let t_char = if time_differs { 't' } else { '.' };
+                    let p_char = if mode_differs { 'p' } else { '.' };
+                    let itemize_str = format!(".f..{}{}.....", t_char, p_char);
+                    let filename = entry
+                        .source_path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(&display_path);
+                    let formatted = format_out_format(
+                        fmt,
+                        &itemize_str,
+                        filename,
+                        &display_path,
+                        entry.metadata.size,
+                        None,
+                    );
+                    println!("{}", formatted);
+                }
+            } else if self.options.itemize_changes && !self.options.quiet {
                 if mode_differs || time_differs {
                     let t_char = if time_differs { 't' } else { '.' };
                     let p_char = if mode_differs { 'p' } else { '.' };

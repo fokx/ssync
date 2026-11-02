@@ -76,6 +76,8 @@ pub fn run_wire_client(
     perms: bool,
     times: bool,
     max_alloc: Option<&str>,
+    remote_options: &[String],
+    list_only: bool,
 ) -> Result<()> {
     // Determine remote side
     let dest_remote = parse_remote_path(dest_raw);
@@ -137,6 +139,14 @@ pub fn run_wire_client(
         cmd.arg("--delete");
     }
 
+    if list_only {
+        cmd.arg("--list-only");
+    }
+
+    for opt in remote_options {
+        cmd.arg(opt);
+    }
+
     if let Some(m) = max_alloc {
         cmd.arg(format!("--max-alloc={}", m));
     }
@@ -193,6 +203,7 @@ pub fn run_wire_client(
             itemize,
             perms,
             times,
+            list_only,
         )?;
     }
 
@@ -281,6 +292,7 @@ pub fn run_wire_server(
             itemize,
             perms,
             times,
+            false,
         )?;
     }
 
@@ -439,6 +451,7 @@ fn wire_recv<R: Read, W: Write>(
     itemize: bool,
     perms: bool,
     times: bool,
+    list_only: bool,
 ) -> Result<()> {
     // 1. Read filter list (0 means empty)
     let filter_len = read_int(reader)?;
@@ -449,6 +462,27 @@ fn wire_recv<R: Read, W: Write>(
 
     // 2. Receive file list
     let entries = recv_wire_file_list(reader)?;
+
+    if list_only {
+        for entry in &entries {
+            let rel = if entry.name.is_empty() {
+                "."
+            } else {
+                &entry.name
+            };
+            let file_type = if (entry.mode & 0o170000) == 0o040000 {
+                FileType::Directory
+            } else if (entry.mode & 0o170000) == 0o120000 {
+                FileType::Symlink
+            } else {
+                FileType::Regular
+            };
+            let mode_str = ssync_fs::metadata::format_mode(entry.mode & 0o777, file_type);
+            let time_str = ssync_fs::metadata::format_time(entry.mtime_secs);
+            println!("{:11} {:12} {} {}", mode_str, entry.size, time_str, rel);
+        }
+        return Ok(());
+    }
 
     if !dest_dir.exists() {
         fs::create_dir_all(dest_dir)?;

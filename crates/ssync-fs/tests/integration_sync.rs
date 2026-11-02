@@ -323,3 +323,33 @@ fn test_dest_symlinked_dir_follows_symlink() {
     assert!(real.join("f.txt").is_file(), "file must land in realdest");
     assert_eq!(fs::read(real.join("f.txt")).unwrap(), b"content\n");
 }
+
+#[test]
+fn test_out_format_and_stats_execution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("testfile.txt"), b"1234567890").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        stats: true,
+        out_format: Some("100%% done %f (%n, %l bytes)".to_string()),
+        human_readable: 1,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("testfile.txt").is_file());
+    assert_eq!(fs::read(dest.join("testfile.txt")).unwrap(), b"1234567890");
+}

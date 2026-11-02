@@ -16,9 +16,13 @@ mod wire;
     name = "ssync",
     author = "ssync contributors",
     disable_version_flag = true,
+    disable_help_flag = true,
     about = "Fast, safe, flag-compatible file synchronization tool in Rust"
 )]
 struct Cli {
+    /// Show this help message
+    #[arg(long = "help")]
+    help: bool,
     /// Recurse into directories
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
@@ -384,8 +388,76 @@ struct Cli {
     compress_choice: Option<String>,
 
     /// Disable incremental recursion
-    #[arg(long = "no-inc-recursive")]
+    #[arg(long = "no-inc-recursive", alias = "no-i-r")]
     no_inc_recursive: bool,
+
+    /// Output numbers in human-readable format
+    #[arg(short = 'h', long = "human-readable", action = clap::ArgAction::Count)]
+    human_readable: u8,
+
+    /// Do not output numbers in human-readable format
+    #[arg(long = "no-h", alias = "no-human-readable")]
+    no_h: bool,
+
+    /// Show progress during transfer
+    #[arg(long = "progress")]
+    progress: bool,
+
+    /// List the files instead of copying them
+    #[arg(long = "list-only")]
+    list_only: bool,
+
+    /// Drop device and special file replication
+    #[arg(long = "drop-D")]
+    drop_d: bool,
+
+    /// Confine transfer root
+    #[arg(long = "confine-root")]
+    confine_root: Option<PathBuf>,
+
+    /// Send option to remote server
+    #[arg(short = 'M', long = "remote-option", action = clap::ArgAction::Append)]
+    remote_option: Vec<String>,
+
+    /// Munge symlinks
+    #[arg(long = "munge-links")]
+    munge_links: bool,
+
+    /// Transfer special files
+    #[arg(long = "specials")]
+    specials: bool,
+
+    /// Do not transfer special files
+    #[arg(long = "no-specials")]
+    no_specials: bool,
+
+    /// Transfer character and block devices
+    #[arg(long = "devices")]
+    devices: bool,
+
+    /// Do not transfer devices
+    #[arg(long = "no-devices")]
+    no_devices: bool,
+
+    /// Do not preserve devices or specials
+    #[arg(long = "no-D")]
+    no_d: bool,
+
+    /// Drop directory symlinks
+    #[arg(long = "drop-dirlinks")]
+    drop_dirlinks: bool,
+
+    /// Write batch file
+    #[arg(long = "write-batch")]
+    write_batch: Option<String>,
+
+    /// Only write batch file
+    #[arg(long = "only-write-batch")]
+    only_write_batch: Option<String>,
+
+    /// Read batch file
+    #[arg(long = "read-batch")]
+    read_batch: Option<String>,
 
     /// Store/recover privileged attributes using xattrs
     #[arg(long = "fake-super")]
@@ -552,6 +624,14 @@ fn main() {
 
     if cli.version {
         println!("ssync version 0.1.0  protocol version 31");
+        return;
+    }
+
+    if cli.help {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        cmd.print_help().unwrap();
+        println!();
         return;
     }
 
@@ -728,7 +808,7 @@ fn main() {
         return;
     }
 
-    if cli.paths.len() < 2 {
+    if cli.paths.is_empty() || (cli.paths.len() < 2 && !cli.list_only) {
         eprintln!("ssync: missing source or destination parameters");
         process::exit(1);
     }
@@ -743,8 +823,14 @@ fn main() {
         .iter()
         .any(|p| wire::parse_remote_path(p).is_some());
     if has_remote {
-        let dest_raw = cli.paths.last().unwrap();
-        let sources_raw = &cli.paths[..cli.paths.len() - 1];
+        let (sources_raw, dest_raw) = if cli.paths.len() == 1 {
+            (&cli.paths[..], "")
+        } else {
+            (
+                &cli.paths[..cli.paths.len() - 1],
+                cli.paths.last().unwrap().as_str(),
+            )
+        };
         if let Err(e) = wire::run_wire_client(
             sources_raw,
             dest_raw,
@@ -757,6 +843,8 @@ fn main() {
             cli.perms || cli.archive,
             cli.times || cli.archive,
             cli.max_alloc.as_deref(),
+            &cli.remote_option,
+            cli.list_only,
         ) {
             eprintln!("ssync [client]: {:#}", e);
             process::exit(1);
@@ -764,8 +852,16 @@ fn main() {
         return;
     }
 
-    let dest_raw = cli.paths.last().unwrap();
-    let sources_raw = &cli.paths[..cli.paths.len() - 1];
+    let dest_raw = if cli.paths.len() == 1 {
+        cli.paths.first().unwrap()
+    } else {
+        cli.paths.last().unwrap()
+    };
+    let sources_raw = if cli.paths.len() == 1 {
+        &cli.paths[..]
+    } else {
+        &cli.paths[..cli.paths.len() - 1]
+    };
 
     let mut dest_path = PathBuf::from(dest_raw.trim_end_matches('/'));
     if dest_path.is_dir() && dest_path.is_symlink() {
@@ -841,6 +937,22 @@ fn main() {
         }
     };
     let scan_had_error = walker.had_error();
+
+    if cli.list_only {
+        for entry in &entries {
+            let rel = if entry.relative_dest_path.as_os_str().is_empty() {
+                "."
+            } else {
+                entry.relative_dest_path.to_str().unwrap_or("")
+            };
+            let mode_str =
+                ssync_fs::metadata::format_mode(entry.metadata.mode, entry.metadata.file_type);
+            let size = entry.metadata.size;
+            let time_str = ssync_fs::metadata::format_time(entry.metadata.mtime_sec);
+            println!("{:11} {:12} {} {}", mode_str, size, time_str, rel);
+        }
+        return;
+    }
 
     if let Some(ref chmod_str) = cli.chmod {
         let chmod_set = ssync_fs::chmod::ChmodSet::parse(chmod_str).unwrap_or_else(|e| {
@@ -931,6 +1043,11 @@ fn main() {
         copy_unsafe_links: cli.copy_unsafe_links,
         mkpath: cli.mkpath,
         filters,
+        out_format: cli.out_format,
+        human_readable: if cli.no_h { 0 } else { cli.human_readable },
+        no_h: cli.no_h,
+        progress: cli.progress,
+        eight_bit_output: cli.eight_bit_output,
     };
 
     let engine = SyncEngine::new(sync_opts);

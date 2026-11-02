@@ -160,6 +160,59 @@ impl FileMetadata {
     }
 }
 
+/// Formats a POSIX file mode into standard `ls -l` representation (e.g. `-rw-r--r--`).
+pub fn format_mode(mode: u32, file_type: FileType) -> String {
+    let type_char = match file_type {
+        FileType::Directory => 'd',
+        FileType::Symlink => 'l',
+        _ => '-',
+    };
+    let rwx = |m: u32| {
+        let r = if m & 4 != 0 { 'r' } else { '-' };
+        let w = if m & 2 != 0 { 'w' } else { '-' };
+        let x = if m & 1 != 0 { 'x' } else { '-' };
+        [r, w, x]
+    };
+    let u = rwx((mode >> 6) & 7);
+    let g = rwx((mode >> 3) & 7);
+    let o = rwx(mode & 7);
+    format!(
+        "{}{}{}{}{}{}{}{}{}{}",
+        type_char, u[0], u[1], u[2], g[0], g[1], g[2], o[0], o[1], o[2]
+    )
+}
+
+/// Formats a POSIX epoch seconds timestamp into `YYYY/MM/DD HH:MM:SS`.
+pub fn format_time(mtime_sec: i64) -> String {
+    let mut tm = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
+    };
+    let sec = mtime_sec as libc::time_t;
+    // SAFETY: localtime_r is thread-safe POSIX
+    unsafe {
+        libc::localtime_r(&sec, &mut tm);
+    }
+    format!(
+        "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
