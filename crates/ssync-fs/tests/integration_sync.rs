@@ -175,3 +175,48 @@ fn test_mkpath_semantics() {
     assert!(dest_deep.exists());
     assert_eq!(fs::read(&dest_deep).unwrap(), b"mkpath payload");
 }
+
+#[test]
+fn test_chmod_integration() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("sub/f.txt"), b"test").unwrap();
+    fs::set_permissions(src.join("sub/f.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let chmod_set = ssync_fs::chmod::ChmodSet::parse("D710,F600").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let mut entries = walker.scan_sources(&sources).unwrap();
+
+    for entry in &mut entries {
+        let is_dir = entry.metadata.file_type == ssync_fs::metadata::FileType::Directory;
+        entry.metadata.mode = chmod_set.apply(entry.metadata.mode, is_dir);
+    }
+
+    let sync_opts = SyncOptions {
+        preserve_perms: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    let file_mode = fs::metadata(dest.join("sub/f.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(file_mode, 0o600);
+
+    let dir_mode = fs::metadata(dest.join("sub")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(dir_mode, 0o710);
+}

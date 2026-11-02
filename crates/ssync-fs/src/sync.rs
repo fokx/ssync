@@ -1387,6 +1387,9 @@ impl SyncEngine {
                 if io_err.raw_os_error() == Some(libc::EXDEV)
                     || io_err.kind() == std::io::ErrorKind::CrossesDevices
                 {
+                    if dest_path.exists() {
+                        let _ = fs::remove_file(dest_path);
+                    }
                     let res = fs::copy(&tmp_path, dest_path);
                     let _ = fs::remove_file(&tmp_path);
                     res?;

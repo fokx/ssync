@@ -1,5 +1,6 @@
 //! ssync-fs: Local filesystem operations, metadata preservation, and path handling.
 
+pub mod chmod;
 pub mod filter;
 pub mod metadata;
 pub mod path;

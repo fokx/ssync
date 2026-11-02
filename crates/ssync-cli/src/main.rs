@@ -679,7 +679,7 @@ fn main() {
 
     let recursive = cli.recursive || cli.archive;
     let links = cli.links || cli.archive;
-    let perms = cli.perms || cli.archive;
+    let perms = cli.perms || cli.archive || cli.chmod.is_some();
     let times = cli.times || cli.archive;
     let owner = cli.owner || cli.archive;
     let group = cli.group || cli.archive;
@@ -721,7 +721,7 @@ fn main() {
     };
 
     let walker = Walker::new(walk_opts);
-    let entries = match walker.scan_sources(&sources) {
+    let mut entries = match walker.scan_sources(&sources) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("ssync: error scanning sources: {}", e);
@@ -729,6 +729,17 @@ fn main() {
         }
     };
     let scan_had_error = walker.had_error();
+
+    if let Some(ref chmod_str) = cli.chmod {
+        let chmod_set = ssync_fs::chmod::ChmodSet::parse(chmod_str).unwrap_or_else(|e| {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        });
+        for entry in &mut entries {
+            let is_dir = entry.metadata.file_type == ssync_fs::metadata::FileType::Directory;
+            entry.metadata.mode = chmod_set.apply(entry.metadata.mode, is_dir);
+        }
+    }
 
     if let Some(ref tdir) = cli.temp_dir {
         let p = Path::new(tdir);
