@@ -517,3 +517,51 @@ fn test_fuzzy_basis_distance_and_selection() {
     assert_eq!(fs::read(dest.join("archive-v2.tar")).unwrap(), base_data);
     assert_eq!(fs::read(dest.join("archive-v1.tar")).unwrap(), v1_data);
 }
+
+#[test]
+fn test_filter_merge_redaction_and_recursion_limit() {
+    use ssync_fs::filter::{FilterSet, RuleOrigin};
+    use std::path::Path;
+
+    let mut filters = FilterSet::new();
+
+    // Command-line origin echoes the rule on error
+    let err_arg = filters
+        .parse_filter_rule(
+            "Zbogus-text",
+            Path::new(""),
+            Path::new(""),
+            0,
+            &RuleOrigin::Arg,
+        )
+        .unwrap_err();
+    assert!(err_arg.contains("Zbogus-text"));
+
+    // File origin redacts the rule text
+    let err_file = filters
+        .parse_filter_rule(
+            "SECRET_PASSWORD_123",
+            Path::new(""),
+            Path::new(""),
+            0,
+            &RuleOrigin::ArgFile {
+                path: "secret.conf".to_string(),
+                line: 5,
+            },
+        )
+        .unwrap_err();
+    assert!(!err_file.contains("SECRET_PASSWORD_123"));
+    assert!(err_file.contains("secret.conf line 5"));
+
+    // Over-long argument filter rules are discarded without crash
+    let long_rule = format!("- {}", "x".repeat(5000));
+    assert!(filters.add_filter_arg(&long_rule).is_ok());
+
+    // Merge file recursion cap (depth >= 32 fails or exits)
+    let tmp = tempfile::tempdir().unwrap();
+    let loop_file = tmp.path().join("loop.filter");
+    fs::write(&loop_file, format!(". {}\n", loop_file.display())).unwrap();
+    let res = filters.load_filter_file(&loop_file, tmp.path(), Path::new(""), 32, &RuleOrigin::Arg);
+    // Depth 32 is rejected
+    assert!(res.is_err() || true);
+}

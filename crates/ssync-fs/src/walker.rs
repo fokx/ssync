@@ -491,8 +491,23 @@ impl Walker {
 
         // Filter evaluation
         let rel_str = rel_dest.to_string_lossy();
-        if !current_filters.is_included(&rel_str, is_dir) {
-            return Ok(());
+        let match_result =
+            current_filters.check_match(&rel_str, is_dir, crate::filter::RuleSide::Sender);
+        if self.options.verbose >= 2 {
+            if let Some((included, rule)) = &match_result {
+                let action = if *included { "showing" } else { "hiding" };
+                let kind = if is_dir { "directory" } else { "file" };
+                let pat_str = rule.format_for_trace();
+                println!(
+                    "[sender] {} {} {} because of pattern {}",
+                    action, kind, rel_str, pat_str
+                );
+            }
+        }
+        if let Some((included, _)) = match_result {
+            if !included {
+                return Ok(());
+            }
         }
 
         // Symlink filter check

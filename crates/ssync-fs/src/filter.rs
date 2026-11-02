@@ -62,6 +62,45 @@ pub enum RuleSide {
     Receiver,
 }
 
+/// Provenance tracking for filter rules to prevent information disclosure in error diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleOrigin {
+    Arg,
+    ArgFile { path: String, line: usize },
+    FileNamedAt { parent_loc: String },
+    UnknownFile,
+}
+
+impl RuleOrigin {
+    pub fn is_from_file(&self) -> bool {
+        !matches!(self, RuleOrigin::Arg)
+    }
+
+    pub fn rule_text(&self, text: &str) -> String {
+        if !self.is_from_file() {
+            return text.to_string();
+        }
+        format!("<rule from {}>", self.where_desc())
+    }
+
+    pub fn where_desc(&self) -> String {
+        match self {
+            RuleOrigin::Arg => "arg".to_string(),
+            RuleOrigin::ArgFile { path, line } => {
+                if *line > 0 {
+                    format!("{} line {}", path, line)
+                } else {
+                    path.clone()
+                }
+            }
+            RuleOrigin::FileNamedAt { parent_loc } => {
+                format!("a file named at {}", parent_loc)
+            }
+            RuleOrigin::UnknownFile => "a file read earlier".to_string(),
+        }
+    }
+}
+
 /// A parsed individual filter rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterRule {
@@ -75,6 +114,7 @@ pub struct FilterRule {
     pub negate: bool,
     pub inherit: bool,
     pub base_dir: PathBuf,
+    pub origin: RuleOrigin,
 }
 
 /// A per-directory merge file specification.
@@ -89,9 +129,21 @@ pub struct DirMergeRule {
     pub no_prefixes: bool,
     pub default_action: RuleAction,
     pub base_dir: PathBuf,
+    pub origin: RuleOrigin,
 }
 
 impl FilterRule {
+    pub fn format_for_trace(&self) -> String {
+        if self.origin.is_from_file() {
+            self.origin.rule_text(&self.pattern)
+        } else {
+            let mut s = self.pattern.clone();
+            if self.dir_only {
+                s.push('/');
+            }
+            s
+        }
+    }
     /// Evaluates whether this rule matches the given path and directory flag.
     /// `rel_path` is relative to the transfer root.
     pub fn matches(&self, rel_path: &str, is_dir: bool) -> bool {
@@ -306,6 +358,7 @@ fn match_char_class(pat: &[u8], ch: u8) -> (bool, &[u8]) {
 pub struct FilterSet {
     rules: Vec<FilterRule>,
     dir_merge_rules: Vec<DirMergeRule>,
+    pub debug_filter: bool,
 }
 
 impl FilterSet {
@@ -313,6 +366,7 @@ impl FilterSet {
         Self {
             rules: Vec::new(),
             dir_merge_rules: Vec::new(),
+            debug_filter: false,
         }
     }
 
@@ -321,29 +375,122 @@ impl FilterSet {
     }
 
     pub fn add_include(&mut self, spec: &str) {
-        self.parse_and_add_rule(spec, RuleAction::Include, false, Path::new(""));
+        self.parse_and_add_rule(
+            spec,
+            RuleAction::Include,
+            false,
+            Path::new(""),
+            &RuleOrigin::Arg,
+        );
     }
 
     pub fn add_exclude(&mut self, spec: &str) {
-        self.parse_and_add_rule(spec, RuleAction::Exclude, false, Path::new(""));
+        self.parse_and_add_rule(
+            spec,
+            RuleAction::Exclude,
+            false,
+            Path::new(""),
+            &RuleOrigin::Arg,
+        );
     }
 
     /// Parses and adds a filter rule from a `--filter` or `-f` argument.
     pub fn add_filter_arg(&mut self, arg: &str) -> Result<(), String> {
-        self.parse_filter_rule(arg, Path::new(""))
+        self.parse_filter_rule(arg, Path::new(""), Path::new(""), 0, &RuleOrigin::Arg)
     }
 
-    /// Loads rules from an exclude/include file (e.g. `--exclude-from` or `--filter=merge`).
+    /// Loads rules from a merge file specified by `--filter=. FILE` or `. FILE`.
+    pub fn load_filter_file(
+        &mut self,
+        path: &Path,
+        fs_dir: &Path,
+        rel_dir: &Path,
+        depth: usize,
+        origin: &RuleOrigin,
+    ) -> Result<(), String> {
+        if depth >= 32 {
+            return Err("merge-file include depth limit (32) exceeded".to_string());
+        }
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                let target_desc = match origin {
+                    RuleOrigin::Arg => format!("'{}'", path.display()),
+                    RuleOrigin::ArgFile { path: p, line: l } => {
+                        format!("<rule from a file named at {} line {}>", p, l)
+                    }
+                    RuleOrigin::FileNamedAt { parent_loc } => {
+                        format!("<rule from a file named at {}>", parent_loc)
+                    }
+                    RuleOrigin::UnknownFile => "<rule from a file read earlier>".to_string(),
+                };
+                eprintln!("cannot open filter file {}: {}", target_desc, e);
+                std::process::exit(11);
+            }
+        };
+        let reader = io::BufReader::new(file);
+        for (idx, line) in reader.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = line.map_err(|e| format!("failed reading filter file: {}", e))?;
+            let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            if trimmed == "!" || trimmed == "clear" {
+                self.rules.clear();
+                continue;
+            }
+            let cur_origin = match origin {
+                RuleOrigin::Arg => RuleOrigin::ArgFile {
+                    path: path.to_string_lossy().to_string(),
+                    line: line_no,
+                },
+                RuleOrigin::ArgFile { path: p, .. } => RuleOrigin::ArgFile {
+                    path: p.clone(),
+                    line: line_no,
+                },
+                RuleOrigin::FileNamedAt { parent_loc } => RuleOrigin::FileNamedAt {
+                    parent_loc: parent_loc.clone(),
+                },
+                RuleOrigin::UnknownFile => RuleOrigin::UnknownFile,
+            };
+            if let Err(e) = self.parse_filter_rule(trimmed, fs_dir, rel_dir, depth, &cur_origin) {
+                eprintln!("{}", e);
+                if e.contains("depth limit") {
+                    std::process::exit(11);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads rules from an exclude/include file (e.g. `--exclude-from` or `--include-from`).
     pub fn load_file(&mut self, path: &Path, default_action: RuleAction) -> io::Result<()> {
         let file = fs::File::open(path)?;
         let reader = io::BufReader::new(file);
-        for line in reader.lines() {
+        for (idx, line) in reader.lines().enumerate() {
+            let line_no = idx + 1;
             let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
                 continue;
             }
-            let _ = self.parse_filter_line(trimmed, default_action, Path::new(""));
+            if trimmed == "!" || trimmed == "clear" {
+                self.rules.clear();
+                continue;
+            }
+            let cur_origin = RuleOrigin::ArgFile {
+                path: path.to_string_lossy().to_string(),
+                line: line_no,
+            };
+            if self
+                .parse_filter_rule(trimmed, Path::new(""), Path::new(""), 0, &cur_origin)
+                .is_err()
+            {
+                self.parse_and_add_rule(trimmed, default_action, false, Path::new(""), &cur_origin);
+            }
         }
         Ok(())
     }
@@ -352,13 +499,27 @@ impl FilterSet {
     pub fn load_stdin(&mut self, default_action: RuleAction) -> io::Result<()> {
         let stdin = io::stdin();
         let reader = stdin.lock();
-        for line in reader.lines() {
+        for (idx, line) in reader.lines().enumerate() {
+            let line_no = idx + 1;
             let line = line?;
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
                 continue;
             }
-            let _ = self.parse_filter_line(trimmed, default_action, Path::new(""));
+            if trimmed == "!" || trimmed == "clear" {
+                self.rules.clear();
+                continue;
+            }
+            let cur_origin = RuleOrigin::ArgFile {
+                path: "-".to_string(),
+                line: line_no,
+            };
+            if self
+                .parse_filter_rule(trimmed, Path::new(""), Path::new(""), 0, &cur_origin)
+                .is_err()
+            {
+                self.parse_and_add_rule(trimmed, default_action, false, Path::new(""), &cur_origin);
+            }
         }
         Ok(())
     }
@@ -376,6 +537,7 @@ impl FilterSet {
                 no_prefixes: false,
                 default_action: RuleAction::Exclude,
                 base_dir: PathBuf::new(),
+                origin: RuleOrigin::Arg,
             });
         }
         for pat in CVS_IGNORE_PATTERNS {
@@ -403,44 +565,31 @@ impl FilterSet {
     pub fn parse_filter_line(
         &mut self,
         line: &str,
-        default_action: RuleAction,
+        _default_action: RuleAction,
         base_dir: &Path,
     ) -> Result<(), String> {
-        let trimmed = line.trim();
-        if trimmed == "!" || trimmed == "clear" {
-            self.rules.clear();
-            return Ok(());
-        }
-
-        if trimmed == ":C" {
-            self.dir_merge_rules.push(DirMergeRule {
-                filename: ".cvsignore".to_string(),
-                side: RuleSide::Both,
-                inherit: false,
-                exclude_self: true,
-                word_split: true,
-                cvs_ignore: true,
-                no_prefixes: false,
-                default_action: RuleAction::Exclude,
-                base_dir: base_dir.to_path_buf(),
-            });
-            return Ok(());
-        }
-
-        if trimmed == "-C" {
-            self.add_cvs_excludes();
-            return Ok(());
-        }
-
-        self.parse_filter_rule(trimmed, base_dir).or_else(|_| {
-            self.parse_and_add_rule(trimmed, default_action, false, base_dir);
-            Ok(())
-        })
+        self.parse_filter_rule(line, base_dir, base_dir, 0, &RuleOrigin::Arg)
     }
 
     /// Parses a filter rule with prefix and modifiers.
-    pub fn parse_filter_rule(&mut self, spec: &str, base_dir: &Path) -> Result<(), String> {
-        let s = spec.trim();
+    pub fn parse_filter_rule(
+        &mut self,
+        spec: &str,
+        fs_dir: &Path,
+        rel_dir: &Path,
+        depth: usize,
+        origin: &RuleOrigin,
+    ) -> Result<(), String> {
+        if spec.len() >= 4096 {
+            if origin.is_from_file() {
+                eprintln!("discarding over-long filter: {}", origin.rule_text(spec));
+            } else {
+                eprintln!("discarding over-long filter: {}", spec);
+            }
+            return Ok(());
+        }
+
+        let s = spec.trim_end_matches(['\r', '\n']).trim_start();
         if s.is_empty() {
             return Ok(());
         }
@@ -450,7 +599,32 @@ impl FilterSet {
             return Ok(());
         }
 
-        // Check for long-form keywords
+        if s == ":C" {
+            self.dir_merge_rules.push(DirMergeRule {
+                filename: ".cvsignore".to_string(),
+                side: RuleSide::Both,
+                inherit: false,
+                exclude_self: true,
+                word_split: true,
+                cvs_ignore: true,
+                no_prefixes: false,
+                default_action: RuleAction::Exclude,
+                base_dir: rel_dir.to_path_buf(),
+                origin: if origin.is_from_file() {
+                    RuleOrigin::UnknownFile
+                } else {
+                    RuleOrigin::Arg
+                },
+            });
+            return Ok(());
+        }
+
+        if s == "-C" {
+            self.add_cvs_excludes();
+            return Ok(());
+        }
+
+        // Check for long-form keywords or short prefixes
         let (prefix, rest) = if let Some(r) = s.strip_prefix("dir-merge") {
             (":", r)
         } else if let Some(r) = s.strip_prefix("merge") {
@@ -468,7 +642,14 @@ impl FilterSet {
         } else if let Some(r) = s.strip_prefix("show") {
             ("S", r)
         } else {
-            (&s[..1], &s[1..])
+            let ch = s.chars().next().unwrap();
+            match ch {
+                ':' | '.' | '-' | '+' | 'P' | 'R' | 'H' | 'S' => (&s[..1], &s[1..]),
+                _ => {
+                    let desc = origin.rule_text(s);
+                    return Err(format!("Unknown filter rule: {}", desc));
+                }
+            }
         };
 
         let mut modifiers = "";
@@ -480,6 +661,13 @@ impl FilterSet {
         } else if rest.starts_with(['-', '+', 'C']) {
             modifiers = rest;
             pattern = "";
+        }
+
+        if !origin.is_from_file()
+            && self.debug_filter
+            && (pattern.ends_with(' ') || pattern.ends_with('\t'))
+        {
+            println!("[client] add_rule({}) -- CAUTION: trailing whitespace!", s);
         }
 
         let mut side = RuleSide::Both;
@@ -512,14 +700,18 @@ impl FilterSet {
                     word_split = true;
                     inherit = false;
                 }
+                '/' => {} // Anchored to transfer root for dir-merge
                 ',' | ' ' | '_' => {}
-                _ => {}
+                _ => {
+                    let desc = origin.rule_text(s);
+                    return Err(format!("invalid modifier in filter rule: {}", desc));
+                }
             }
         }
 
         match prefix {
             ":" => {
-                let fname = if pattern.is_empty() {
+                let raw_fname = if pattern.is_empty() {
                     if cvs_ignore {
                         ".cvsignore"
                     } else {
@@ -527,6 +719,12 @@ impl FilterSet {
                     }
                 } else {
                     pattern
+                };
+                let fname = raw_fname.strip_prefix('/').unwrap_or(raw_fname);
+                let dm_origin = if origin.is_from_file() {
+                    RuleOrigin::UnknownFile
+                } else {
+                    RuleOrigin::Arg
                 };
                 self.dir_merge_rules.push(DirMergeRule {
                     filename: fname.to_string(),
@@ -537,50 +735,80 @@ impl FilterSet {
                     cvs_ignore,
                     no_prefixes,
                     default_action,
-                    base_dir: base_dir.to_path_buf(),
+                    base_dir: rel_dir.to_path_buf(),
+                    origin: dm_origin,
                 });
                 if exclude_self {
-                    self.add_exclude(fname);
+                    let base_pattern = fname.rsplit('/').next().unwrap_or(fname);
+                    let self_rule =
+                        Self::parse_rule(base_pattern, RuleAction::Exclude, false, rel_dir, origin);
+                    self.rules.push(self_rule);
                 }
             }
             "." => {
+                if depth >= 32 {
+                    return Err("merge-file include depth limit (32) exceeded".to_string());
+                }
                 if pattern == "-" {
                     self.load_stdin(RuleAction::Exclude)
                         .map_err(|e| format!("failed to read stdin filter rules: {}", e))?;
                 } else {
-                    self.load_file(Path::new(pattern), RuleAction::Exclude)
-                        .map_err(|e| format!("cannot open filter file '{}': {}", pattern, e))?;
+                    let file_to_open = if fs_dir.as_os_str().is_empty() {
+                        PathBuf::from(pattern)
+                    } else {
+                        fs_dir.join(pattern)
+                    };
+                    let child_origin = match origin {
+                        RuleOrigin::Arg => RuleOrigin::ArgFile {
+                            path: file_to_open.to_string_lossy().to_string(),
+                            line: 1,
+                        },
+                        RuleOrigin::ArgFile { path: p, line: l } => RuleOrigin::FileNamedAt {
+                            parent_loc: format!("{} line {}", p, l),
+                        },
+                        RuleOrigin::FileNamedAt { parent_loc } => RuleOrigin::FileNamedAt {
+                            parent_loc: parent_loc.clone(),
+                        },
+                        RuleOrigin::UnknownFile => RuleOrigin::UnknownFile,
+                    };
+                    self.load_filter_file(
+                        &file_to_open,
+                        fs_dir,
+                        rel_dir,
+                        depth + 1,
+                        &child_origin,
+                    )?;
                 }
             }
             "+" => {
-                self.parse_and_add_rule(pattern, RuleAction::Include, negate, base_dir);
+                self.parse_and_add_rule(pattern, RuleAction::Include, negate, rel_dir, origin);
             }
             "-" => {
                 if (cvs_ignore && pattern.is_empty()) || pattern == "C" {
                     self.add_cvs_excludes();
                 } else {
-                    self.parse_and_add_rule(pattern, RuleAction::Exclude, negate, base_dir);
+                    self.parse_and_add_rule(pattern, RuleAction::Exclude, negate, rel_dir, origin);
                 }
             }
             "P" => {
-                self.parse_and_add_rule(pattern, RuleAction::Protect, negate, base_dir);
+                self.parse_and_add_rule(pattern, RuleAction::Protect, negate, rel_dir, origin);
             }
             "R" => {
-                self.parse_and_add_rule(pattern, RuleAction::Risk, negate, base_dir);
+                self.parse_and_add_rule(pattern, RuleAction::Risk, negate, rel_dir, origin);
             }
             "H" => {
-                let mut rule = Self::parse_rule(pattern, RuleAction::Exclude, negate, base_dir);
+                let mut rule =
+                    Self::parse_rule(pattern, RuleAction::Exclude, negate, rel_dir, origin);
                 rule.side = RuleSide::Sender;
                 self.rules.push(rule);
             }
             "S" => {
-                let mut rule = Self::parse_rule(pattern, RuleAction::Include, negate, base_dir);
+                let mut rule =
+                    Self::parse_rule(pattern, RuleAction::Include, negate, rel_dir, origin);
                 rule.side = RuleSide::Sender;
                 self.rules.push(rule);
             }
-            _ => {
-                return Err(format!("Unknown filter rule prefix in '{}'", spec));
-            }
+            _ => unreachable!(),
         }
 
         Ok(())
@@ -592,13 +820,20 @@ impl FilterSet {
         action: RuleAction,
         negate: bool,
         base_dir: &Path,
+        origin: &RuleOrigin,
     ) {
-        let rule = Self::parse_rule(spec, action, negate, base_dir);
+        let rule = Self::parse_rule(spec, action, negate, base_dir, origin);
         self.rules.push(rule);
     }
 
-    fn parse_rule(spec: &str, action: RuleAction, negate: bool, base_dir: &Path) -> FilterRule {
-        let mut s = spec.trim();
+    fn parse_rule(
+        spec: &str,
+        action: RuleAction,
+        negate: bool,
+        base_dir: &Path,
+        origin: &RuleOrigin,
+    ) -> FilterRule {
+        let mut s = spec.trim_end_matches(['\r', '\n']).trim_start();
         let mut dir_only = false;
         let mut anchored = false;
 
@@ -627,6 +862,7 @@ impl FilterSet {
             negate,
             inherit: true,
             base_dir: base_dir.to_path_buf(),
+            origin: origin.clone(),
         }
     }
 
@@ -640,21 +876,31 @@ impl FilterSet {
         self.is_included_side(rel_path, is_dir, RuleSide::Receiver)
     }
 
-    pub fn is_included_side(&self, rel_path: &str, is_dir: bool, current_side: RuleSide) -> bool {
+    pub fn check_match(
+        &self,
+        rel_path: &str,
+        is_dir: bool,
+        current_side: RuleSide,
+    ) -> Option<(bool, &FilterRule)> {
         for rule in &self.rules {
             if rule.side != RuleSide::Both && rule.side != current_side {
                 continue;
             }
             if rule.matches(rel_path, is_dir) {
-                return match rule.action {
+                let included = match rule.action {
                     RuleAction::Include | RuleAction::Risk => true,
                     RuleAction::Exclude | RuleAction::Protect => false,
                     RuleAction::Clear => true,
                 };
+                return Some((included, rule));
             }
         }
-        // Default is included
-        true
+        None
+    }
+
+    pub fn is_included_side(&self, rel_path: &str, is_dir: bool, current_side: RuleSide) -> bool {
+        self.check_match(rel_path, is_dir, current_side)
+            .is_none_or(|(inc, _)| inc)
     }
 
     /// Evaluates whether a destination path is protected from deletion.
@@ -696,11 +942,20 @@ impl FilterSet {
             }
 
             let merge_file_path = dir_path.join(&dm.filename);
+            if merge_file_path.as_os_str().len() >= 4096 {
+                eprintln!(
+                    "merge-file name overflows: {}",
+                    dm.origin.rule_text(&dm.filename)
+                );
+                continue;
+            }
+
             if merge_file_path.is_file() {
                 if let Ok(file) = fs::File::open(&merge_file_path) {
                     let mut file_rules = Vec::new();
                     let reader = io::BufReader::new(file);
-                    for line in reader.lines().map_while(Result::ok) {
+                    for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
+                        let line_no = idx + 1;
                         let trimmed = line.trim();
                         if trimmed.is_empty()
                             || trimmed.starts_with('#')
@@ -714,9 +969,29 @@ impl FilterSet {
                             continue;
                         }
 
+                        let cur_origin = match &dm.origin {
+                            RuleOrigin::Arg => RuleOrigin::ArgFile {
+                                path: dm.filename.clone(),
+                                line: line_no,
+                            },
+                            RuleOrigin::ArgFile { path, .. } => RuleOrigin::ArgFile {
+                                path: path.clone(),
+                                line: line_no,
+                            },
+                            RuleOrigin::FileNamedAt { parent_loc } => RuleOrigin::FileNamedAt {
+                                parent_loc: parent_loc.clone(),
+                            },
+                            RuleOrigin::UnknownFile => RuleOrigin::UnknownFile,
+                        };
+
                         if dm.no_prefixes {
-                            let mut rule =
-                                Self::parse_rule(trimmed, dm.default_action, false, rel_dir);
+                            let mut rule = Self::parse_rule(
+                                trimmed,
+                                dm.default_action,
+                                false,
+                                rel_dir,
+                                &cur_origin,
+                            );
                             rule.inherit = dm.inherit;
                             file_rules.push(rule);
                         } else if dm.word_split {
@@ -725,23 +1000,38 @@ impl FilterSet {
                                     file_rules.clear();
                                     continue;
                                 }
-                                let mut rule =
-                                    Self::parse_rule(word, RuleAction::Exclude, false, rel_dir);
+                                let mut rule = Self::parse_rule(
+                                    word,
+                                    RuleAction::Exclude,
+                                    false,
+                                    rel_dir,
+                                    &cur_origin,
+                                );
                                 rule.inherit = dm.inherit;
                                 file_rules.push(rule);
                             }
                         } else {
                             let mut local_set = FilterSet::new();
-                            if local_set
-                                .parse_filter_line(trimmed, RuleAction::Exclude, rel_dir)
-                                .is_ok()
-                            {
-                                for mut r in local_set.rules {
-                                    r.inherit = dm.inherit;
-                                    file_rules.push(r);
+                            local_set.debug_filter = self.debug_filter;
+                            match local_set.parse_filter_rule(
+                                trimmed,
+                                dir_path,
+                                rel_dir,
+                                0,
+                                &cur_origin,
+                            ) {
+                                Ok(()) => {
+                                    for mut r in local_set.rules {
+                                        r.inherit = dm.inherit;
+                                        file_rules.push(r);
+                                    }
+                                    for dm_rule in local_set.dir_merge_rules {
+                                        self.dir_merge_rules.push(dm_rule);
+                                    }
                                 }
-                                for dm_rule in local_set.dir_merge_rules {
-                                    self.dir_merge_rules.push(dm_rule);
+                                Err(e) => {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
                                 }
                             }
                         }

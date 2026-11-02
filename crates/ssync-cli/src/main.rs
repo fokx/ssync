@@ -251,9 +251,9 @@ struct Cli {
     #[arg(short = 'C', long = "cvs-exclude")]
     cvs_exclude: bool,
 
-    /// Shorthand for :C (dir-merge .cvsignore) / -C
+    /// Shorthand for : /.rsync-filter (repeat for - .rsync-filter)
     #[arg(short = 'F', action = clap::ArgAction::Count)]
-    filter_cvs: u8,
+    filter_rsync: u8,
 
     /// Read exclude patterns from FILE
     #[arg(long = "exclude-from", action = clap::ArgAction::Append)]
@@ -749,22 +749,38 @@ fn main() {
 
     // Set up filter rules
     let mut filters = FilterSet::new();
+    if let Some(ref d) = cli.debug {
+        if d.contains("FILTER") || d.contains("all") {
+            filters.debug_filter = true;
+        }
+    }
 
-    if cli.filter_cvs >= 2 {
-        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
-        filters.add_cvs_excludes();
-    } else if cli.filter_cvs == 1 {
-        let _ = filters.parse_filter_line(":C", RuleAction::Exclude, Path::new(""));
+    if cli.filter_rsync >= 1 {
+        if let Err(e) = filters.add_filter_arg(": /.rsync-filter") {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        }
+    }
+    if cli.filter_rsync >= 2 {
+        if let Err(e) = filters.add_filter_arg("- .rsync-filter") {
+            eprintln!("ssync: {}", e);
+            process::exit(1);
+        }
     }
 
     if cli.cvs_exclude {
+        let _ = filters.add_filter_arg(":C");
         filters.add_cvs_excludes();
     }
 
     for arg in &cli.filter {
         if let Err(e) = filters.add_filter_arg(arg) {
             eprintln!("ssync: {}", e);
-            process::exit(1);
+            if e.contains("depth limit") {
+                process::exit(11);
+            } else {
+                process::exit(1);
+            }
         }
     }
 
