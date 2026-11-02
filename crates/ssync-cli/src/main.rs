@@ -356,7 +356,7 @@ struct Cli {
     log_file: Option<String>,
 
     /// Log format
-    #[arg(long = "log-file-format")]
+    #[arg(long = "log-file-format", alias = "log-format")]
     log_file_format: Option<String>,
 
     /// Stop after MINS minutes have elapsed
@@ -824,6 +824,9 @@ fn main() {
         filters.add_exclude(exc);
     }
 
+    let backup_dir = cli.backup_dir.as_deref().map(PathBuf::from);
+    let suffix = cli.suffix.clone().unwrap_or_else(|| "~".to_string());
+
     if cli.server {
         if let Err(e) = wire::run_wire_server(
             cli.sender,
@@ -834,6 +837,9 @@ fn main() {
             cli.perms || cli.archive,
             cli.times || cli.archive,
             cli.files_from.as_deref(),
+            cli.backup,
+            backup_dir,
+            suffix,
         ) {
             eprintln!("ssync [server]: {:#}", e);
             process::exit(1);
@@ -879,6 +885,17 @@ fn main() {
             &cli.remote_option,
             cli.files_from.as_deref(),
             cli.list_only,
+            cli.backup,
+            cli.backup_dir.as_deref(),
+            cli.partial,
+            cli.partial_dir.as_deref(),
+            cli.inplace,
+            cli.append,
+            cli.delay_updates,
+            cli.temp_dir.as_deref(),
+            &cli.link_dest,
+            &cli.copy_dest,
+            &cli.compare_dest,
         ) {
             eprintln!("ssync [client]: {:#}", e);
             process::exit(1);
@@ -1021,9 +1038,7 @@ fn main() {
         }
     }
 
-    let backup_dir = cli.backup_dir.map(PathBuf::from);
     let temp_dir = cli.temp_dir.map(PathBuf::from);
-    let suffix = cli.suffix.unwrap_or_else(|| "~".to_string());
     let itemize_changes = cli.itemize_changes > 0;
     let verbose = if cli.itemize_changes > 1 && cli.verbose < 2 {
         2

@@ -79,6 +79,17 @@ pub fn run_wire_client(
     remote_options: &[String],
     files_from: Option<&str>,
     list_only: bool,
+    backup: bool,
+    backup_dir: Option<&str>,
+    partial: bool,
+    partial_dir: Option<&str>,
+    inplace: bool,
+    append: bool,
+    delay_updates: bool,
+    temp_dir: Option<&str>,
+    link_dest: &[String],
+    copy_dest: &[String],
+    compare_dest: &[String],
 ) -> Result<()> {
     // Determine remote side
     let dest_remote = parse_remote_path(dest_raw);
@@ -142,6 +153,40 @@ pub fn run_wire_client(
 
     if list_only {
         cmd.arg("--list-only");
+    }
+
+    if backup {
+        cmd.arg("-b");
+    }
+    if let Some(bd) = backup_dir {
+        cmd.arg(format!("--backup-dir={}", bd));
+    }
+    if partial {
+        cmd.arg("--partial");
+    }
+    if let Some(pd) = partial_dir {
+        cmd.arg(format!("--partial-dir={}", pd));
+    }
+    if inplace {
+        cmd.arg("--inplace");
+    }
+    if append {
+        cmd.arg("--append");
+    }
+    if delay_updates {
+        cmd.arg("--delay-updates");
+    }
+    if let Some(td) = temp_dir {
+        cmd.arg(format!("--temp-dir={}", td));
+    }
+    for ld in link_dest {
+        cmd.arg(format!("--link-dest={}", ld));
+    }
+    for cd in copy_dest {
+        cmd.arg(format!("--copy-dest={}", cd));
+    }
+    for cmp in compare_dest {
+        cmd.arg(format!("--compare-dest={}", cmp));
     }
 
     if let Some(ff) = files_from {
@@ -210,6 +255,7 @@ pub fn run_wire_client(
     } else {
         // Client is RECEIVER, remote server is SENDER
         let local_dest = Path::new(dest_raw.trim_end_matches('/'));
+        let bd_path = backup_dir.map(Path::new);
         wire_recv(
             local_dest,
             &mut reader,
@@ -220,6 +266,9 @@ pub fn run_wire_client(
             perms,
             times,
             list_only,
+            backup,
+            bd_path,
+            "~",
         )?;
     }
 
@@ -234,6 +283,7 @@ pub fn run_wire_client(
 }
 
 /// Runs ssync in server mode (`--server`).
+#[allow(clippy::too_many_arguments)]
 pub fn run_wire_server(
     is_sender: bool,
     protect_args: bool,
@@ -243,6 +293,9 @@ pub fn run_wire_server(
     perms: bool,
     times: bool,
     files_from: Option<&str>,
+    backup: bool,
+    backup_dir: Option<PathBuf>,
+    suffix: String,
 ) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -310,6 +363,9 @@ pub fn run_wire_server(
             perms,
             times,
             false,
+            backup,
+            backup_dir.as_deref(),
+            &suffix,
         )?;
     }
 
@@ -478,6 +534,9 @@ fn wire_recv<R: Read, W: Write>(
     perms: bool,
     times: bool,
     list_only: bool,
+    backup: bool,
+    backup_dir: Option<&Path>,
+    suffix: &str,
 ) -> Result<()> {
     // 1. Read filter list (0 means empty)
     let filter_len = read_int(reader)?;
@@ -580,7 +639,13 @@ fn wire_recv<R: Read, W: Write>(
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let _ = fs::remove_file(&target_path);
+                if let Ok(meta) = target_path.symlink_metadata() {
+                    if meta.is_dir() {
+                        let _ = fs::remove_dir(&target_path);
+                    } else {
+                        let _ = fs::remove_file(&target_path);
+                    }
+                }
                 std::os::unix::fs::symlink(target, &target_path)?;
                 if itemize {
                     report_info(
@@ -605,6 +670,27 @@ fn wire_recv<R: Read, W: Write>(
             // Regular file
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
+            }
+
+            if backup && target_path.exists() {
+                let bak_path = if let Some(bd) = backup_dir {
+                    bd.join(&entry.name)
+                } else {
+                    let mut s = target_path.as_os_str().to_os_string();
+                    s.push(suffix);
+                    PathBuf::from(s)
+                };
+                if let Some(parent) = bak_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Err(e) = fs::copy(&target_path, &bak_path) {
+                    eprintln!(
+                        "ssync [server]: backup to {} failed: {}",
+                        bak_path.display(),
+                        e
+                    );
+                    bail!("backup to {} failed: {}", bak_path.display(), e);
+                }
             }
 
             let basis_data = if target_path.is_file() {
@@ -720,4 +806,33 @@ fn reconstruct_from_tokens(basis: &[u8], tokens: &[DeltaToken], block_len: usize
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_remote_path() {
+        assert_eq!(
+            parse_remote_path("user@host:path/to/file"),
+            Some((
+                Some("user".to_string()),
+                "host".to_string(),
+                "path/to/file".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_remote_path("host:path/to/file"),
+            Some((None, "host".to_string(), "path/to/file".to_string()))
+        );
+        assert_eq!(parse_remote_path("/local/path/to/file"), None);
+    }
+
+    #[test]
+    fn test_safe_arg() {
+        assert_eq!(safe_arg("plain_path", false), "plain_path");
+        assert_eq!(safe_arg("path with spaces", false), "path\\ with\\ spaces");
+        assert_eq!(safe_arg("path with spaces", true), "path with spaces");
+    }
 }

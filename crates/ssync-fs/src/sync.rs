@@ -1064,8 +1064,12 @@ impl SyncEngine {
                 if let Some(parent) = dest_path.parent() {
                     safe_create_dir_all(dest_root, parent)?;
                 }
-                if dest_path.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(dest_path);
+                if let Ok(meta) = dest_path.symlink_metadata() {
+                    if meta.is_dir() {
+                        let _ = fs::remove_dir(dest_path);
+                    } else {
+                        let _ = fs::remove_file(dest_path);
+                    }
                 }
                 std::os::unix::fs::symlink(target, dest_path)?;
                 entry.metadata.apply_to(
@@ -1108,8 +1112,12 @@ impl SyncEngine {
                     safe_create_dir_all(dest_root, parent)?;
                 }
 
-                if dest_path.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(dest_path);
+                if let Ok(meta) = dest_path.symlink_metadata() {
+                    if meta.is_dir() {
+                        let _ = fs::remove_dir(dest_path);
+                    } else {
+                        let _ = fs::remove_file(dest_path);
+                    }
                 }
 
                 std::os::unix::fs::symlink(target, dest_path)?;
@@ -1382,8 +1390,12 @@ impl SyncEngine {
                 if let Some(parent) = dest_path.parent() {
                     safe_create_dir_all(dest_root, parent)?;
                 }
-                if dest_path.symlink_metadata().is_ok() {
-                    let _ = fs::remove_file(dest_path);
+                if let Ok(meta) = dest_path.symlink_metadata() {
+                    if meta.is_dir() {
+                        let _ = fs::remove_dir(dest_path);
+                    } else {
+                        let _ = fs::remove_file(dest_path);
+                    }
                 }
                 if is_link {
                     fs::hard_link(&cand, dest_path)?;
