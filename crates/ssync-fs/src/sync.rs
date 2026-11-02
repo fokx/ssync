@@ -74,6 +74,7 @@ pub struct SyncOptions {
     pub copy_links: bool,
     pub copy_dirlinks: bool,
     pub copy_unsafe_links: bool,
+    pub mkpath: bool,
     pub filters: FilterSet,
 }
 
@@ -127,6 +128,23 @@ fn copy_sparse(reader: &mut File, writer: &mut File, total_len: u64) -> std::io:
     }
     writer.set_len(total_len)?;
     Ok(total_len)
+}
+
+fn count_missing_dirs(path: &Path) -> usize {
+    let mut count = 0;
+    let mut curr = path;
+    while !curr.as_os_str().is_empty() && !curr.exists() {
+        count += 1;
+        if let Some(parent) = curr.parent() {
+            if parent == curr {
+                break;
+            }
+            curr = parent;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 impl SyncEngine {
@@ -261,22 +279,54 @@ impl SyncEngine {
     /// Executes the synchronization of entries into `dest_root`.
     pub fn execute(&self, entries: &[TransferEntry], dest_root: &Path) -> Result<(), FsError> {
         let dest_existed = dest_root.exists();
-        if !self.options.dry_run && !dest_existed {
-            if self.options.dest_is_file {
-                if let Some(parent) = dest_root.parent() {
+        if self.options.dest_is_file {
+            let parent = dest_root.parent().unwrap_or_else(|| Path::new(""));
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                if !self.options.mkpath {
+                    return Err(FsError::ChangeDirFailed(parent.to_path_buf()));
+                }
+                let missing = count_missing_dirs(parent);
+                if (self.options.itemize_changes || self.options.verbose > 0) && !self.options.quiet
+                {
+                    let word = if missing == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    };
+                    println!("created {} {} for {}", missing, word, parent.display());
+                }
+                if !self.options.dry_run {
                     fs::create_dir_all(parent)?;
                 }
-            } else {
-                fs::create_dir_all(dest_root)?;
             }
-        }
-
-        if !dest_existed
-            && !self.options.dest_is_file
-            && (self.options.verbose > 0 || self.options.itemize_changes)
-            && !self.options.quiet
-        {
-            println!("created directory {}", dest_root.display());
+        } else if !dest_existed {
+            let parent = dest_root.parent().unwrap_or_else(|| Path::new(""));
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                if !self.options.mkpath {
+                    return Err(FsError::ChangeDirFailed(dest_root.to_path_buf()));
+                }
+                let missing = count_missing_dirs(dest_root);
+                if (self.options.itemize_changes || self.options.verbose > 0) && !self.options.quiet
+                {
+                    let word = if missing == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    };
+                    println!("created {} {} for {}", missing, word, dest_root.display());
+                }
+                if !self.options.dry_run {
+                    fs::create_dir_all(dest_root)?;
+                }
+            } else {
+                if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet
+                {
+                    println!("created directory {}", dest_root.display());
+                }
+                if !self.options.dry_run {
+                    fs::create_dir(dest_root)?;
+                }
+            }
         }
 
         let transferred_paths: HashSet<PathBuf> = entries

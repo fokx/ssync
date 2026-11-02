@@ -122,3 +122,56 @@ fn test_filter_and_deletion() {
     assert!(!dest.join("exclude.log").exists());
     assert!(!dest.join("stray.txt").exists());
 }
+
+#[test]
+fn test_mkpath_semantics() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest_deep = tmp.path().join("a/b/c/dest_file");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("file.txt"), b"mkpath payload").unwrap();
+
+    let walk_opts = WalkOptions {
+        dest_is_file: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(
+        &src.join("file.txt").to_string_lossy(),
+    )];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    // 1. Without mkpath, fails with ChangeDirFailed
+    let sync_no_mkpath = SyncOptions {
+        dest_is_file: true,
+        mkpath: false,
+        ..Default::default()
+    };
+    let engine1 = SyncEngine::new(sync_no_mkpath);
+    let res = engine1.execute(&entries, &dest_deep);
+    assert!(res.is_err());
+    assert!(!dest_deep.parent().unwrap().exists());
+
+    // 2. Dry-run with mkpath succeeds without creating dirs
+    let sync_dry_mkpath = SyncOptions {
+        dest_is_file: true,
+        mkpath: true,
+        dry_run: true,
+        ..Default::default()
+    };
+    let engine2 = SyncEngine::new(sync_dry_mkpath);
+    assert!(engine2.execute(&entries, &dest_deep).is_ok());
+    assert!(!dest_deep.parent().unwrap().exists());
+
+    // 3. Real run with mkpath succeeds and creates dirs + file
+    let sync_real_mkpath = SyncOptions {
+        dest_is_file: true,
+        mkpath: true,
+        ..Default::default()
+    };
+    let engine3 = SyncEngine::new(sync_real_mkpath);
+    assert!(engine3.execute(&entries, &dest_deep).is_ok());
+    assert!(dest_deep.exists());
+    assert_eq!(fs::read(&dest_deep).unwrap(), b"mkpath payload");
+}

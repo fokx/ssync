@@ -371,6 +371,10 @@ struct Cli {
     #[arg(long = "skip-compress")]
     skip_compress: Option<String>,
 
+    /// Create destination's missing path components
+    #[arg(long = "mkpath")]
+    mkpath: bool,
+
     /// Source and destination paths
     #[arg(required = false)]
     paths: Vec<String>,
@@ -798,12 +802,21 @@ fn main() {
         copy_links: cli.copy_links,
         copy_dirlinks: cli.copy_dirlinks,
         copy_unsafe_links: cli.copy_unsafe_links,
+        mkpath: cli.mkpath,
         filters,
     };
 
     let engine = SyncEngine::new(sync_opts);
     if let Err(e) = engine.execute(&entries, &dest_path) {
         match e {
+            FsError::ChangeDirFailed(p) => {
+                eprintln!(
+                    "rsync: [Receiver] change_dir#3 \"{}\" failed: No such file or directory (2)",
+                    p.display()
+                );
+                eprintln!("rsync error: errors selecting input/output files, dirs (code 3)");
+                process::exit(3);
+            }
             FsError::DeleteLimitReached(_) => {
                 eprintln!("ssync: {}", e);
                 process::exit(25);

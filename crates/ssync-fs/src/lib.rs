@@ -17,6 +17,8 @@ pub enum FsError {
     MetadataError(String),
     #[error("Deletion limit exceeded: {0}")]
     DeleteLimitReached(usize),
+    #[error("change_dir \"{0}\" failed: No such file or directory")]
+    ChangeDirFailed(std::path::PathBuf),
     #[error("Some files/attrs were not transferred")]
     PartialTransfer,
 }
