@@ -83,6 +83,8 @@ pub struct SyncOptions {
     pub safe_links: bool,
     pub mkpath: bool,
     pub fuzzy: u8,
+    pub super_user: bool,
+    pub no_super: bool,
     pub filters: FilterSet,
     pub out_format: Option<String>,
     pub human_readable: u8,

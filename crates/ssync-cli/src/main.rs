@@ -471,6 +471,14 @@ struct Cli {
     #[arg(long = "fake-super")]
     fake_super: bool,
 
+    /// Receiver attempts super-user activities
+    #[arg(long = "super", overrides_with = "no_super")]
+    super_user: bool,
+
+    /// Disable super-user activities
+    #[arg(long = "no-super", overrides_with = "super_user")]
+    no_super: bool,
+
     /// Run as a remote server
     #[arg(long = "server")]
     server: bool,
@@ -1084,6 +1092,8 @@ fn main() {
         safe_links: cli.safe_links,
         mkpath: cli.mkpath,
         fuzzy: if cli.no_fuzzy { 0 } else { cli.fuzzy },
+        super_user: cli.super_user,
+        no_super: cli.no_super,
         filters,
         out_format: cli.out_format,
         human_readable: if cli.no_h { 0 } else { cli.human_readable },

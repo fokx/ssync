@@ -565,3 +565,47 @@ fn test_filter_merge_redaction_and_recursion_limit() {
     // Depth 32 is rejected
     assert!(res.is_err() || true);
 }
+
+#[test]
+fn test_delete_delay_read_only_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(src.join("keep"), b"keep\n").unwrap();
+
+    // Create read-only files in destination with long names
+    for i in 0..10 {
+        let name = format!("del{:02}-{}", i, "n".repeat(100));
+        let p = dest.join(name);
+        fs::write(&p, b"old\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        delete_delay: true,
+        no_super: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("keep").exists());
+    let remaining: Vec<_> = fs::read_dir(&dest)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("del"))
+        .collect();
+    assert_eq!(remaining.len(), 0);
+}
