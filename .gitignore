@@ -11,6 +11,7 @@ Cargo.lock
 
 # Test scratch directories & upstream artifacts
 testtmp/
+test-results/
 target/upstream-tooldir/
 *.corrupt.*
 valgrind-logs/
