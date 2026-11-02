@@ -1924,20 +1924,39 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
-            let mut f = OpenOptions::new()
+            let open_res = OpenOptions::new()
                 .write(true)
+                .create(true)
                 .truncate(true)
-                .open(dest_path)?;
+                .open(dest_path);
+            let mut f = match open_res {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(dest_path)
+                    .map_err(|_| FsError::Io(e))?,
+                Err(e) => return Err(FsError::Io(e)),
+            };
             f.write_all(&reconstructed)?;
             f.flush()?;
         } else {
             let mut src_file =
                 safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
-            let mut dst_file = OpenOptions::new()
+            let open_res = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(dest_path)?;
+                .open(dest_path);
+            let mut dst_file = match open_res {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(dest_path)
+                    .map_err(|_| FsError::Io(e))?,
+                Err(e) => return Err(FsError::Io(e)),
+            };
             let copied = if self.options.sparse {
                 copy_sparse(&mut src_file, &mut dst_file, entry.metadata.size)?
             } else {

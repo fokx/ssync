@@ -609,3 +609,34 @@ fn test_delete_delay_read_only_files() {
         .collect();
     assert_eq!(remaining.len(), 0);
 }
+
+#[test]
+fn test_inplace_protected_regular_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(src.join("file.txt"), b"new updated content\n").unwrap();
+    fs::write(dest.join("file.txt"), b"old content\n").unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        inplace: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert_eq!(
+        fs::read(dest.join("file.txt")).unwrap(),
+        b"new updated content\n"
+    );
+}
