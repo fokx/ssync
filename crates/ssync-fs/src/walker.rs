@@ -139,8 +139,8 @@ impl Walker {
                         } else {
                             anc.clone()
                         };
-                        let meta = if real_anc.exists() {
-                            FileMetadata::from_path(&real_anc, false)?
+                        let mut meta = if let Ok(m) = FileMetadata::from_path(&real_anc, true) {
+                            m
                         } else {
                             FileMetadata {
                                 file_type: FileType::Directory,
@@ -158,6 +158,8 @@ impl Walker {
                                 symlink_target: None,
                             }
                         };
+                        meta.file_type = FileType::Directory;
+                        meta.symlink_target = None;
 
                         entries.push(TransferEntry {
                             source_path: real_anc,

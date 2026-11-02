@@ -812,6 +812,7 @@ fn main() {
         sparse: cli.sparse,
         copy_links: cli.copy_links,
         copy_dirlinks: cli.copy_dirlinks,
+        keep_dirlinks: cli.keep_dirlinks,
         copy_unsafe_links: cli.copy_unsafe_links,
         mkpath: cli.mkpath,
         filters,

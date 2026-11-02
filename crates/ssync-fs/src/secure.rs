@@ -77,6 +77,22 @@ impl Drop for DirFd {
     }
 }
 
+/// Checks whether `path` is strictly contained within `root`.
+pub fn is_beneath(root: &Path, path: &Path) -> bool {
+    let clean_root = crate::path::clean_path(root);
+    let clean_target = crate::path::clean_path(path);
+
+    if clean_root.as_os_str().is_empty() || clean_root == Path::new(".") {
+        !clean_target.is_absolute() && !clean_target.starts_with("..")
+    } else if clean_root.is_absolute() {
+        clean_target.starts_with(&clean_root)
+    } else if clean_target.is_absolute() {
+        false
+    } else {
+        clean_target.starts_with(&clean_root)
+    }
+}
+
 /// Creates all parent directory components for `target_dir` confined strictly beneath `dest_root`.
 ///
 /// Follows the held-dirfd pattern: each component is created with `mkdirat` and pinned with `openat`
@@ -96,11 +112,32 @@ pub fn safe_create_dir_all(dest_root: &Path, target_dir: &Path) -> Result<(), Fs
         }
         let mut cur_fd = DirFd::open_dir(dest_root, false)?;
 
+        let mut cur_path = dest_root.to_path_buf();
         for comp in rel.components() {
             if let std::path::Component::Normal(c) = comp {
                 let name = Path::new(c);
                 let _ = cur_fd.mkdirat(name, 0o777);
-                let next_fd = cur_fd.openat_dir(name, true)?;
+                let next_fd = match cur_fd.openat_dir(name, true) {
+                    Ok(next) => next,
+                    Err(e) => {
+                        let full_path = cur_path.join(name);
+                        if let Ok(link_target) = fs::read_link(&full_path) {
+                            let resolved = if link_target.is_absolute() {
+                                crate::path::clean_path(&link_target)
+                            } else {
+                                crate::path::clean_path(&cur_path.join(&link_target))
+                            };
+                            if is_beneath(dest_root, &resolved) && resolved.is_dir() {
+                                cur_fd.openat_dir(name, false)?
+                            } else {
+                                return Err(FsError::Io(e));
+                            }
+                        } else {
+                            return Err(FsError::Io(e));
+                        }
+                    }
+                };
+                cur_path.push(c);
                 cur_fd = next_fd;
             }
         }
@@ -152,10 +189,32 @@ pub fn safe_open_source(
             start_fd
         } else {
             let mut cur = start_fd;
+            let mut cur_path = root.to_path_buf();
             for comp in p.components() {
                 match comp {
                     std::path::Component::Normal(c) => {
-                        let next = cur.openat_dir(Path::new(c), !follow_symlinks)?;
+                        let name = Path::new(c);
+                        let next = match cur.openat_dir(name, !follow_symlinks) {
+                            Ok(next) => next,
+                            Err(e) => {
+                                let full_path = cur_path.join(name);
+                                if let Ok(link_target) = fs::read_link(&full_path) {
+                                    let resolved = if link_target.is_absolute() {
+                                        crate::path::clean_path(&link_target)
+                                    } else {
+                                        crate::path::clean_path(&cur_path.join(&link_target))
+                                    };
+                                    if is_beneath(root, &resolved) && resolved.is_dir() {
+                                        cur.openat_dir(name, false)?
+                                    } else {
+                                        return Err(e);
+                                    }
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        };
+                        cur_path.push(c);
                         cur = next;
                     }
                     std::path::Component::CurDir => {}
@@ -212,9 +271,31 @@ pub fn safe_rename_into(
                 DirFd::open_dir(dest_root, false)?
             } else {
                 let mut cur_fd = DirFd::open_dir(dest_root, false)?;
+                let mut cur_path = dest_root.to_path_buf();
                 for comp in p.components() {
                     if let std::path::Component::Normal(c) = comp {
-                        let next_fd = cur_fd.openat_dir(Path::new(c), true)?;
+                        let name = Path::new(c);
+                        let next_fd = match cur_fd.openat_dir(name, true) {
+                            Ok(next) => next,
+                            Err(e) => {
+                                let full_path = cur_path.join(name);
+                                if let Ok(link_target) = fs::read_link(&full_path) {
+                                    let resolved = if link_target.is_absolute() {
+                                        crate::path::clean_path(&link_target)
+                                    } else {
+                                        crate::path::clean_path(&cur_path.join(&link_target))
+                                    };
+                                    if is_beneath(dest_root, &resolved) && resolved.is_dir() {
+                                        cur_fd.openat_dir(name, false)?
+                                    } else {
+                                        return Err(FsError::Io(e));
+                                    }
+                                } else {
+                                    return Err(FsError::Io(e));
+                                }
+                            }
+                        };
+                        cur_path.push(c);
                         cur_fd = next_fd;
                     }
                 }

@@ -73,6 +73,7 @@ pub struct SyncOptions {
     pub sparse: bool,
     pub copy_links: bool,
     pub copy_dirlinks: bool,
+    pub keep_dirlinks: bool,
     pub copy_unsafe_links: bool,
     pub mkpath: bool,
     pub filters: FilterSet,
@@ -504,6 +505,14 @@ impl SyncEngine {
                 false,
             ));
             return Ok(());
+        }
+
+        let is_dest_symlink = dest_path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_dest_symlink && !self.options.keep_dirlinks && !self.options.dry_run {
+            let _ = fs::remove_file(dest_path);
         }
 
         let newly_created = if is_root {

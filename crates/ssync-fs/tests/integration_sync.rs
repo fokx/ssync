@@ -220,3 +220,73 @@ fn test_chmod_integration() {
     let dir_mode = fs::metadata(dest.join("sub")).unwrap().permissions().mode() & 0o7777;
     assert_eq!(dir_mode, 0o710);
 }
+
+#[test]
+fn test_keep_dirlinks_and_symlinked_parent() {
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(src.join("real/sub")).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(src.join("real/sub/file.txt"), b"in-tree content").unwrap();
+    std::os::unix::fs::symlink("real", src.join("link")).unwrap();
+
+    // 1. -aR through an in-tree symlink parent
+    let walk_opts = WalkOptions {
+        recursive: true,
+        links: true,
+        relative: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!(
+        "{}/./link/sub/file.txt",
+        src.display()
+    ))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        relative: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert!(dest.join("link/sub/file.txt").is_file());
+    assert_eq!(
+        fs::read(dest.join("link/sub/file.txt")).unwrap(),
+        b"in-tree content"
+    );
+
+    // 2. --keep-dirlinks: writes land through destination symlinked dir
+    let dest2 = tmp.path().join("dest2");
+    fs::create_dir_all(dest2.join("target")).unwrap();
+    std::os::unix::fs::symlink("target", dest2.join("d")).unwrap();
+
+    let src2 = tmp.path().join("src2");
+    fs::create_dir_all(src2.join("d")).unwrap();
+    fs::write(src2.join("d/item.txt"), b"through symlink").unwrap();
+
+    let walk_opts2 = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker2 = Walker::new(walk_opts2);
+    let sources2 = vec![SourcePath::from_raw(&format!("{}/", src2.display()))];
+    let entries2 = walker2.scan_sources(&sources2).unwrap();
+
+    let sync_opts2 = SyncOptions {
+        keep_dirlinks: true,
+        ..Default::default()
+    };
+    let engine2 = SyncEngine::new(sync_opts2);
+    engine2.execute(&entries2, &dest2).unwrap();
+
+    assert!(dest2.join("d").is_symlink());
+    assert!(dest2.join("target/item.txt").is_file());
+    assert_eq!(
+        fs::read(dest2.join("target/item.txt")).unwrap(),
+        b"through symlink"
+    );
+}
