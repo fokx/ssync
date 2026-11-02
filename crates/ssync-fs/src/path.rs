@@ -96,6 +96,56 @@ pub fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Formats a filename for terminal output, escaping C0/C1 control characters and DEL as `\#NNN`.
+pub fn format_terminal_filename(raw: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+
+        if i + 4 < raw.len()
+            && b == b'\\'
+            && raw[i + 1] == b'#'
+            && raw[i + 2].is_ascii_digit()
+            && raw[i + 3].is_ascii_digit()
+            && raw[i + 4].is_ascii_digit()
+        {
+            out.extend_from_slice(b"\\#134");
+            i += 1;
+            continue;
+        }
+
+        if let Ok(s) = std::str::from_utf8(&raw[i..]) {
+            if let Some(ch) = s.chars().next() {
+                let char_len = ch.len_utf8();
+                let is_control = match ch as u32 {
+                    0x09 => false,
+                    0x00..=0x1f | 0x7f..=0x9f => true,
+                    _ => false,
+                };
+
+                if is_control {
+                    for &byte in &raw[i..i + char_len] {
+                        out.extend_from_slice(format!("\\#{:03o}", byte).as_bytes());
+                    }
+                } else {
+                    out.extend_from_slice(&raw[i..i + char_len]);
+                }
+                i += char_len;
+                continue;
+            }
+        }
+
+        if b != b'\t' && (b < b' ' || b == 0x7f || (0x80..=0x9f).contains(&b)) {
+            out.extend_from_slice(format!("\\#{:03o}", b).as_bytes());
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +189,30 @@ mod tests {
         assert_eq!(
             p.implied_ancestors(),
             vec![PathBuf::from("b"), PathBuf::from("b/c")]
+        );
+    }
+
+    #[test]
+    fn test_terminal_filename_escaping() {
+        assert_eq!(
+            format_terminal_filename(b"raw_\x9b_name"),
+            "raw_\\#233_name"
+        );
+        assert_eq!(
+            format_terminal_filename(b"utf8_\xc2\x9b_name"),
+            "utf8_\\#302\\#233_name"
+        );
+        assert_eq!(
+            format_terminal_filename(b"\rleading_cr_name"),
+            "\\#015leading_cr_name"
+        );
+        assert_eq!(
+            format_terminal_filename(b"delete_\x7f_name"),
+            "delete_\\#177_name"
+        );
+        assert_eq!(
+            format_terminal_filename(b"valid_\xd8\x9b_name"),
+            "valid_\u{061b}_name"
         );
     }
 }

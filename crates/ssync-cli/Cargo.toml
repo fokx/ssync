@@ -21,6 +21,7 @@ ssync-proto.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

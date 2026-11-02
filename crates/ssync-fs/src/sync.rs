@@ -12,6 +12,8 @@ use ssync_core::delta::{
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Match type for alternate destination directory.
@@ -31,6 +33,8 @@ pub struct SyncOptions {
     pub preserve_perms: bool,
     pub preserve_times: bool,
     pub omit_dir_times: bool,
+    pub omit_link_times: bool,
+    pub executability: bool,
     pub preserve_owner: bool,
     pub preserve_group: bool,
     pub hard_links: bool,
@@ -65,6 +69,7 @@ pub struct SyncOptions {
     pub stats: bool,
     pub debug: Option<String>,
     pub info: Option<String>,
+    pub log_file: Option<PathBuf>,
     pub link_dest: Vec<PathBuf>,
     pub copy_dest: Vec<PathBuf>,
     pub compare_dest: Vec<PathBuf>,
@@ -277,6 +282,32 @@ impl SyncEngine {
         None
     }
 
+    fn log_transfer(&self, action: &str, path: &Path) {
+        if let Some(ref log_path) = self.options.log_file {
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                use std::io::Write;
+                use std::os::unix::ffi::OsStrExt;
+                let raw = path.as_os_str().as_bytes();
+                let mut escaped = Vec::new();
+                for &b in raw {
+                    if b < 0x20 || (0x80..=0x9f).contains(&b) || b == 0x7f {
+                        escaped.extend_from_slice(format!("\\#{:03o}", b).as_bytes());
+                    } else {
+                        escaped.push(b);
+                    }
+                }
+                let _ = f.write_all(action.as_bytes());
+                let _ = f.write_all(b" ");
+                let _ = f.write_all(&escaped);
+                let _ = f.write_all(b"\n");
+            }
+        }
+    }
+
     /// Executes the synchronization of entries into `dest_root`.
     pub fn execute(&self, entries: &[TransferEntry], dest_root: &Path) -> Result<(), FsError> {
         let dest_existed = dest_root.exists();
@@ -474,16 +505,23 @@ impl SyncEngine {
         dirs_to_update: &mut Vec<(PathBuf, PathBuf, FileMetadata, bool)>,
     ) -> Result<(), FsError> {
         let is_root = entry.relative_dest_path.as_os_str().is_empty();
-        let display_dir = if is_root {
-            "./".to_string()
+        use std::os::unix::ffi::OsStrExt;
+        let raw_dir = if is_root {
+            b"./".to_vec()
         } else if self.options.relative
             && entry.source_path.is_absolute()
             && !entry.source_path.to_string_lossy().contains("/./")
         {
-            format!("/{}/", entry.relative_dest_path.display())
+            let mut v = b"/".to_vec();
+            v.extend_from_slice(entry.relative_dest_path.as_os_str().as_bytes());
+            v.push(b'/');
+            v
         } else {
-            format!("{}/", entry.relative_dest_path.display())
+            let mut v = entry.relative_dest_path.as_os_str().as_bytes().to_vec();
+            v.push(b'/');
+            v
         };
+        let display_dir = crate::path::format_terminal_filename(&raw_dir);
 
         if let Some((_alt_match, _)) =
             self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
@@ -584,6 +622,7 @@ impl SyncEngine {
             .as_ref()
             .ok_or_else(|| FsError::MetadataError("Symlink target missing".to_string()))?;
 
+        let preserve_link_times = self.options.preserve_times && !self.options.omit_link_times;
         if let Some((alt_type, _cand)) =
             self.find_alt_dest_match(&entry.relative_dest_path, &entry.metadata, dest_root)
         {
@@ -608,7 +647,7 @@ impl SyncEngine {
                 entry.metadata.apply_to(
                     dest_path,
                     self.options.preserve_perms,
-                    self.options.preserve_times,
+                    preserve_link_times,
                     self.options.preserve_owner,
                     self.options.preserve_group,
                 )?;
@@ -653,11 +692,13 @@ impl SyncEngine {
                 entry.metadata.apply_to(
                     dest_path,
                     self.options.preserve_perms,
-                    self.options.preserve_times,
+                    preserve_link_times,
                     self.options.preserve_owner,
                     self.options.preserve_group,
                 )?;
             }
+
+            self.log_transfer("cL+++++++++", &entry.relative_dest_path);
 
             if (self.options.verbose > 0 || self.options.itemize_changes) && !self.options.quiet {
                 if self.options.itemize_changes {
@@ -692,11 +733,12 @@ impl SyncEngine {
             }
         } else {
             // Target matches: unchanged symlink
+            let preserve_link_times = self.options.preserve_times && !self.options.omit_link_times;
             if !self.options.dry_run {
                 entry.metadata.apply_to(
                     dest_path,
                     self.options.preserve_perms,
-                    self.options.preserve_times,
+                    preserve_link_times,
                     self.options.preserve_owner,
                     self.options.preserve_group,
                 )?;
@@ -810,20 +852,23 @@ impl SyncEngine {
             }
         }
 
-        let display_path = if entry.relative_dest_path.as_os_str().is_empty() {
+        let raw_display = if entry.relative_dest_path.as_os_str().is_empty() {
             entry
                 .source_path
                 .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
+                .map(|f| f.as_bytes().to_vec())
                 .unwrap_or_default()
         } else if self.options.relative
             && entry.source_path.is_absolute()
             && !entry.source_path.to_string_lossy().contains("/./")
         {
-            format!("/{}", entry.relative_dest_path.display())
+            let mut v = b"/".to_vec();
+            v.extend_from_slice(entry.relative_dest_path.as_os_str().as_bytes());
+            v
         } else {
-            entry.relative_dest_path.display().to_string()
+            entry.relative_dest_path.as_os_str().as_bytes().to_vec()
         };
+        let display_path = crate::path::format_terminal_filename(&raw_display);
 
         // Handle directory replacement when dest_path exists and is a directory
         if let Ok(meta) = fs::symlink_metadata(dest_path) {
@@ -1119,14 +1164,34 @@ impl SyncEngine {
                 }
 
                 if !self.options.delay_updates {
-                    entry.metadata.apply_to(
-                        dest_path,
-                        self.options.preserve_perms,
-                        self.options.preserve_times,
-                        self.options.preserve_owner,
-                        self.options.preserve_group,
-                    )?;
+                    if self.options.preserve_perms {
+                        entry.metadata.apply_to(
+                            dest_path,
+                            true,
+                            self.options.preserve_times,
+                            self.options.preserve_owner,
+                            self.options.preserve_group,
+                        )?;
+                    } else {
+                        // Apply default destination perms: source mode & 0o777 & ~umask
+                        // SAFETY: umask is a standard POSIX call
+                        let umask = unsafe {
+                            let u = libc::umask(0);
+                            libc::umask(u);
+                            u
+                        };
+                        let new_mode = (entry.metadata.mode & 0o777) & !(umask as u32);
+                        let _ =
+                            fs::set_permissions(dest_path, fs::Permissions::from_mode(new_mode));
+                        if self.options.preserve_times {
+                            entry
+                                .metadata
+                                .apply_to(dest_path, false, true, false, false)?;
+                        }
+                    }
                 }
+
+                self.log_transfer(">f+++++++++", &entry.relative_dest_path);
 
                 if self.options.remove_source_files {
                     let _ = fs::remove_file(&entry.source_path);
@@ -1166,13 +1231,36 @@ impl SyncEngine {
                 );
 
             if !self.options.dry_run {
-                entry.metadata.apply_to(
-                    dest_path,
-                    self.options.preserve_perms,
-                    self.options.preserve_times,
-                    self.options.preserve_owner,
-                    self.options.preserve_group,
-                )?;
+                if self.options.preserve_perms {
+                    entry.metadata.apply_to(
+                        dest_path,
+                        true,
+                        self.options.preserve_times,
+                        self.options.preserve_owner,
+                        self.options.preserve_group,
+                    )?;
+                } else {
+                    if self.options.executability {
+                        let src_exec = (entry.metadata.mode & 0o111) != 0;
+                        let mut new_mode = dest_meta.mode;
+                        if !src_exec {
+                            new_mode &= !0o111;
+                        } else if (dest_meta.mode & 0o111) == 0 {
+                            new_mode |= (new_mode & 0o444) >> 2;
+                        }
+                        if new_mode != dest_meta.mode {
+                            let _ = fs::set_permissions(
+                                dest_path,
+                                fs::Permissions::from_mode(new_mode),
+                            );
+                        }
+                    }
+                    if self.options.preserve_times {
+                        entry
+                            .metadata
+                            .apply_to(dest_path, false, true, false, false)?;
+                    }
+                }
             }
 
             if self.options.itemize_changes && !self.options.quiet {

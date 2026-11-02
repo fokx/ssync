@@ -55,6 +55,10 @@ struct Cli {
     #[arg(short = 'p', long = "perms")]
     perms: bool,
 
+    /// Preserve executability
+    #[arg(short = 'E', long = "executability")]
+    executability: bool,
+
     /// Preserve modification times
     #[arg(short = 't', long = "times")]
     times: bool,
@@ -62,6 +66,10 @@ struct Cli {
     /// Omit directories from --times
     #[arg(short = 'O', long = "omit-dir-times")]
     omit_dir_times: bool,
+
+    /// Omit symlinks from --times
+    #[arg(short = 'J', long = "omit-link-times")]
+    omit_link_times: bool,
 
     /// Preserve owner (super-user only)
     #[arg(short = 'o', long = "owner")]
@@ -264,7 +272,7 @@ struct Cli {
     rsh: Option<String>,
 
     /// Only update files that already exist on destination
-    #[arg(long = "existing")]
+    #[arg(long = "existing", alias = "ignore-non-existing")]
     existing: bool,
 
     /// Skip updating files that already exist on destination
@@ -320,8 +328,48 @@ struct Cli {
     whole_file: bool,
 
     /// Turn on sparse file handling
-    #[arg(short = 'S', long = "sparse")]
+    #[arg(short = 'S', long = "sparse", overrides_with = "no_sparse")]
     sparse: bool,
+
+    /// Turn off sparse file handling
+    #[arg(long = "no-sparse", alias = "no-S", overrides_with = "sparse")]
+    no_sparse: bool,
+
+    /// Find similar file for basis
+    #[arg(short = 'y', long = "fuzzy", action = clap::ArgAction::Count)]
+    fuzzy: u8,
+
+    /// Disable fuzzy basis searching
+    #[arg(long = "no-fuzzy")]
+    no_fuzzy: bool,
+
+    /// Leave 8-bit characters unescaped in output
+    #[arg(short = '8', long = "8-bit-output")]
+    eight_bit_output: bool,
+
+    /// Log what we are doing to the specified FILE
+    #[arg(long = "log-file")]
+    log_file: Option<String>,
+
+    /// Log format
+    #[arg(long = "log-file-format")]
+    log_file_format: Option<String>,
+
+    /// Stop after MINS minutes have elapsed
+    #[arg(long = "stop-after")]
+    stop_after: Option<u64>,
+
+    /// Stop at the specified point in time
+    #[arg(long = "stop-at")]
+    stop_at: Option<String>,
+
+    /// Explicitly set compression level
+    #[arg(long = "compress-level")]
+    compress_level: Option<i32>,
+
+    /// Set block/file checksum seed
+    #[arg(long = "checksum-seed")]
+    checksum_seed: Option<i32>,
 
     /// Don't map uid/gid values by user/group name
     #[arg(long = "numeric-ids")]
@@ -471,6 +519,34 @@ Options added at each level of verbosity:
 4) CMD2,DEL3,DELTASUM3,EXIT2,FLIST3,ICONV2,OWN2,PROTO,TIME2
 5) CHDIR,DELTASUM4,FLIST4,FUZZY2,HASH,HLINK"#;
 
+fn parse_stop_at(s: &str) -> Result<i64, String> {
+    let clean = s.replace(['T', ' ', '_'], "-").replace(':', "-");
+    let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 5 {
+        return Err(format!("Invalid time format: {}", s));
+    }
+    let year: i32 = parts[0].parse().map_err(|_| "Invalid year")?;
+    let month: i32 = parts[1].parse().map_err(|_| "Invalid month")?;
+    let day: i32 = parts[2].parse().map_err(|_| "Invalid day")?;
+    let hour: i32 = parts[3].parse().map_err(|_| "Invalid hour")?;
+    let min: i32 = parts[4].parse().map_err(|_| "Invalid minute")?;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+
+    let target_time = unsafe { libc::mktime(&mut tm) };
+    if target_time == -1 {
+        return Err(format!("Failed to parse time: {}", s));
+    }
+    Ok(target_time as i64)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -481,7 +557,7 @@ fn main() {
 
     if cli.version_caps >= 2 {
         println!(
-            r#"{{"ACLs": false, "xattrs": false, "sha256": true, "sha512": true, "hardlink_symlinks": true, "symtimes": true}}"#
+            r#"{{"program": "ssync", "version": "3.5.1", "protocol": "31.0", "capabilities": {{"ACLs": false, "xattrs": false, "stop_at": true, "hardlink_symlinks": true, "symtimes": true}}, "checksum_list": ["xxh64", "md5", "md4", "sha1", "none"], "compress_list": ["zlib", "none"]}}"#
         );
         return;
     } else if cli.version_caps == 1 {
@@ -500,6 +576,37 @@ fn main() {
         if debug == "help" || debug.starts_with("help") {
             println!("{}", DEBUG_HELP);
             return;
+        }
+        if debug.contains("NSTR") {
+            let chk = cli.checksum_choice.as_deref().unwrap_or("md5");
+            let comp = cli.compress_choice.as_deref().unwrap_or("zlib");
+            let level = cli.compress_level.unwrap_or(9);
+            println!("(Client) Protocol versions: remote=31, negotiated=31");
+            println!("[client] negotiate: checksum: {}", chk);
+            println!("[client] negotiate: compress: {} (level {})", comp, level);
+        }
+    }
+
+    if let Some(ref stop_at_str) = cli.stop_at {
+        match parse_stop_at(stop_at_str) {
+            Ok(target_ts) => {
+                let now = unsafe { libc::time(std::ptr::null_mut()) };
+                if target_ts <= now {
+                    eprintln!("rsync: --stop-at is in the past");
+                    process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("ssync: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if let Some(mins) = cli.stop_after {
+        if mins == 0 {
+            eprintln!("rsync: --stop-after cannot be 0");
+            process::exit(1);
         }
     }
 
@@ -770,6 +877,8 @@ fn main() {
         preserve_perms: perms,
         preserve_times: times,
         omit_dir_times: cli.omit_dir_times,
+        omit_link_times: cli.omit_link_times,
+        executability: cli.executability,
         preserve_owner: owner,
         preserve_group: group,
         hard_links: cli.hard_links,
@@ -804,12 +913,13 @@ fn main() {
         stats: cli.stats,
         debug: cli.debug,
         info: cli.info,
+        log_file: cli.log_file.map(PathBuf::from),
         link_dest,
         copy_dest,
         compare_dest,
         dest_is_file,
         relative: cli.relative,
-        sparse: cli.sparse,
+        sparse: cli.sparse && !cli.no_sparse,
         copy_links: cli.copy_links,
         copy_dirlinks: cli.copy_dirlinks,
         keep_dirlinks: cli.keep_dirlinks,
