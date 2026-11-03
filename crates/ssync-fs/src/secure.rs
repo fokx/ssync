@@ -162,7 +162,21 @@ pub fn safe_open_source(
 
     let root = match source_root {
         Some(r) => r,
-        None => return fs::File::open(source_path),
+        None => {
+            let c_path = CString::new(source_path.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+            if !follow_symlinks {
+                flags |= libc::O_NOFOLLOW;
+            }
+            // SAFETY: c_path is a valid null-terminated C string.
+            let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            } else {
+                return Ok(unsafe { fs::File::from_raw_fd(fd) });
+            }
+        }
     };
 
     let (parent_rel, leaf_name) = if root.as_os_str() == "." || root.as_os_str().is_empty() {

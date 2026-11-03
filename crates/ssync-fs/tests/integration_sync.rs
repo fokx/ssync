@@ -1009,3 +1009,36 @@ fn test_backup_deletion_with_ignore_existing() {
     assert!(!dest.join("foo").exists());
     assert_eq!(fs::read(dest.join("foo~")).unwrap(), b"old live foo");
 }
+
+#[test]
+fn test_safe_open_source_refuses_symlink_leaf() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+
+    let secret = outside.join("secret");
+    fs::write(&secret, b"secret content").unwrap();
+
+    let symlink = root.join("raced_symlink");
+    std::os::unix::fs::symlink(&secret, &symlink).unwrap();
+
+    // safe_open_source without follow_symlinks must refuse opening the symlink leaf
+    let res = ssync_fs::secure::safe_open_source(&symlink, Some(&root), false);
+    assert!(
+        res.is_err(),
+        "Opening symlink leaf with follow=false must fail"
+    );
+    let err = res.unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+    // When source_root is None, it must also refuse opening symlink leaf with follow=false
+    let res_noroot = ssync_fs::secure::safe_open_source(&symlink, None, false);
+    assert!(
+        res_noroot.is_err(),
+        "Opening symlink leaf with root=None and follow=false must fail"
+    );
+    let err_noroot = res_noroot.unwrap_err();
+    assert_eq!(err_noroot.raw_os_error(), Some(libc::ELOOP));
+}

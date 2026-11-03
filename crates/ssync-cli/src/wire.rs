@@ -6,6 +6,7 @@ use ssync_core::delta::{BlockSignature, DeltaToken, SumStruct, generate_delta};
 use ssync_fs::filter::FilterSet;
 use ssync_fs::metadata::{FileMetadata, FileType};
 use ssync_fs::path::SourcePath;
+use ssync_fs::secure::safe_open_source;
 use ssync_fs::walker::{WalkOptions, Walker};
 use ssync_proto::flist::{WireFileEntry, recv_wire_file_list, send_wire_file_list};
 use ssync_proto::handshake::{
@@ -568,7 +569,6 @@ fn wire_send<R: Read, W: Write>(
     };
 
     let mut entries = Vec::new();
-    let mut file_payloads = Vec::new();
 
     for te in &transfer_entries {
         let is_symlink = te.metadata.file_type == FileType::Symlink;
@@ -601,13 +601,6 @@ fn wire_send<R: Read, W: Write>(
             gid: te.metadata.gid,
             symlink_target,
         });
-
-        if te.metadata.file_type == FileType::Regular {
-            let content = fs::read(&te.source_path)?;
-            file_payloads.push(Some(content));
-        } else {
-            file_payloads.push(None);
-        }
     }
 
     // Send file list
@@ -618,51 +611,72 @@ fn wire_send<R: Read, W: Write>(
     }
 
     // Transfer regular files
-    for (_entry, content_opt) in entries.iter().zip(file_payloads.iter()) {
-        if let Some(content) = content_opt {
-            // Read basis block checksums from receiver
-            let (sum_struct, wire_sums) = recv_block_checksums(reader)?;
+    for (idx, te) in transfer_entries.iter().enumerate() {
+        if te.metadata.file_type != FileType::Regular {
+            continue;
+        }
 
-            let whole_file_md5 = calculate_strong_checksum(ChecksumAlgorithm::Md5, content, None);
+        // Read basis block checksums from receiver
+        let (sum_struct, wire_sums) = recv_block_checksums(reader)?;
 
-            if sum_struct.count == 0 {
-                // Whole file transfer
-                send_delta_tokens(
+        // Safely open source file with O_NOFOLLOW
+        let file_res = safe_open_source(&te.source_path, te.source_root.as_deref(), false);
+        let mut file = match file_res {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = report_info(
+                    is_server,
                     writer,
-                    &[DeltaToken::Literal(content.clone())],
-                    &whole_file_md5,
-                )?;
-            } else {
-                // Compute deltas using BlockSignature
-                let mut sigs = Vec::with_capacity(wire_sums.len());
-                let mut offset = 0u64;
-                for (i, ws) in wire_sums.iter().enumerate() {
-                    let block_len = if i == wire_sums.len() - 1 && sum_struct.remainder > 0 {
-                        sum_struct.remainder
-                    } else {
-                        sum_struct.block_len
-                    };
-                    sigs.push(BlockSignature {
-                        index: i as u32,
-                        offset,
-                        len: block_len,
-                        sum1: ws.sum1,
-                        sum2: ws.sum2.clone(),
-                    });
-                    offset += block_len as u64;
-                }
-
-                let (tokens, _stats) = generate_delta(
-                    content,
-                    &sigs,
-                    &sum_struct,
-                    ChecksumAlgorithm::Md5,
-                    None,
-                    false,
+                    &format!(
+                        "send_files failed to open {}: {}\n",
+                        te.source_path.display(),
+                        e
+                    ),
                 );
-
-                send_delta_tokens(writer, &tokens, &whole_file_md5)?;
+                let numbuf = (idx as i32).to_le_bytes();
+                writer.send_msg(MsgCode::NoSend, &numbuf)?;
+                continue;
             }
+        };
+
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)?;
+
+        let whole_file_md5 = calculate_strong_checksum(ChecksumAlgorithm::Md5, &content, None);
+
+        if sum_struct.count == 0 {
+            // Whole file transfer
+            send_delta_tokens(writer, &[DeltaToken::Literal(content)], &whole_file_md5)?;
+        } else {
+            // Compute deltas using BlockSignature
+            let mut sigs = Vec::with_capacity(wire_sums.len());
+            let mut offset = 0u64;
+            for (i, ws) in wire_sums.iter().enumerate() {
+                let block_len = if i == wire_sums.len() - 1 && sum_struct.remainder > 0 {
+                    sum_struct.remainder
+                } else {
+                    sum_struct.block_len
+                };
+                sigs.push(BlockSignature {
+                    index: i as u32,
+                    offset,
+                    len: block_len,
+                    sum1: ws.sum1,
+                    sum2: ws.sum2.clone(),
+                });
+                offset += block_len as u64;
+            }
+
+            let (tokens, _stats) = generate_delta(
+                &content,
+                &sigs,
+                &sum_struct,
+                ChecksumAlgorithm::Md5,
+                None,
+                false,
+            );
+
+            send_delta_tokens(writer, &tokens, &whole_file_md5)?;
         }
     }
 
