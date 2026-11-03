@@ -91,6 +91,7 @@ pub struct SyncOptions {
     pub no_h: bool,
     pub progress: bool,
     pub eight_bit_output: bool,
+    pub bwlimit: Option<u64>,
 }
 
 pub struct SyncEngine {
@@ -276,9 +277,21 @@ fn format_thousands(mut n: u64) -> String {
 
 const WRITE_BUFFER_SIZE: usize = 256 * 1024;
 
-fn copy_buffered<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::Result<u64> {
-    let mut buffer = vec![0u8; WRITE_BUFFER_SIZE];
-    let mut total = 0;
+fn copy_buffered<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    bwlimit: Option<u64>,
+) -> std::io::Result<u64> {
+    let chunk_size = if let Some(limit) = bwlimit {
+        ((limit / 20).clamp(1024, WRITE_BUFFER_SIZE as u64)) as usize
+    } else {
+        WRITE_BUFFER_SIZE
+    };
+
+    let mut buffer = vec![0u8; chunk_size];
+    let mut total = 0u64;
+    let start_time = std::time::Instant::now();
+
     loop {
         let n = reader.read(&mut buffer)?;
         if n == 0 {
@@ -286,6 +299,17 @@ fn copy_buffered<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::
         }
         writer.write_all(&buffer[..n])?;
         total += n as u64;
+
+        if let Some(limit) = bwlimit {
+            if limit > 0 {
+                let expected_duration =
+                    std::time::Duration::from_secs_f64(total as f64 / limit as f64);
+                let elapsed = start_time.elapsed();
+                if expected_duration > elapsed {
+                    std::thread::sleep(expected_duration - elapsed);
+                }
+            }
+        }
     }
     Ok(total)
 }
@@ -838,8 +862,15 @@ impl SyncEngine {
             };
 
             if let Err(e) = res {
-                eprintln!("ssync: {}: {}", dest_path.display(), e);
-                had_partial_error = true;
+                match e {
+                    FsError::PartialTransfer => {
+                        had_partial_error = true;
+                    }
+                    _ => {
+                        eprintln!("ssync: {}: {}", dest_path.display(), e);
+                        had_partial_error = true;
+                    }
+                }
             }
         }
 
@@ -1886,9 +1917,17 @@ impl SyncEngine {
         let mut dst_file = OpenOptions::new().write(true).open(dest_path)?;
         dst_file.seek(SeekFrom::Start(dst_len))?;
 
-        let appended = copy_buffered(&mut src_file, &mut dst_file)?;
+        let appended = copy_buffered(&mut src_file, &mut dst_file, self.options.bwlimit)?;
         dst_file.flush()?;
         total_stats.literal_bytes += appended;
+
+        if dst_len + appended < entry.metadata.size {
+            eprintln!(
+                "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                entry.source_path.display()
+            );
+            return Err(FsError::PartialTransfer);
+        }
 
         if self.options.append_verify {
             let src_file =
@@ -1902,7 +1941,8 @@ impl SyncEngine {
                     .write(true)
                     .truncate(true)
                     .open(dest_path)?;
-                let full_copied = copy_buffered(&mut full_src, &mut full_dst)?;
+                let full_copied =
+                    copy_buffered(&mut full_src, &mut full_dst, self.options.bwlimit)?;
                 full_dst.flush()?;
                 total_stats.literal_bytes += full_copied;
             }
@@ -1952,6 +1992,14 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
+            if (source.len() as u64) < entry.metadata.size {
+                eprintln!(
+                    "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                    entry.source_path.display()
+                );
+                return Err(FsError::PartialTransfer);
+            }
+
             let existing_len = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
             let open_res = OpenOptions::new()
                 .write(true)
@@ -1993,8 +2041,15 @@ impl SyncEngine {
             let copied = if self.options.sparse {
                 copy_sparse(&mut src_file, &mut dst_file, entry.metadata.size)?
             } else {
-                copy_buffered(&mut src_file, &mut dst_file)?
+                copy_buffered(&mut src_file, &mut dst_file, self.options.bwlimit)?
             };
+            if copied < entry.metadata.size {
+                eprintln!(
+                    "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                    entry.source_path.display()
+                );
+                return Err(FsError::PartialTransfer);
+            }
             if copied < existing_len {
                 dst_file.set_len(copied)?;
             }
@@ -2058,6 +2113,15 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
+            if (source.len() as u64) < entry.metadata.size {
+                let _ = fs::remove_file(&tmp_path);
+                eprintln!(
+                    "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                    entry.source_path.display()
+                );
+                return Err(FsError::PartialTransfer);
+            }
+
             if let Err(e) = fs::write(&tmp_path, &reconstructed) {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(FsError::Io(e));
@@ -2084,11 +2148,23 @@ impl SyncEngine {
                                 .create(true)
                                 .truncate(true)
                                 .open(&tmp_path)
-                                .and_then(|mut dst| copy_buffered(&mut src, &mut dst))
+                                .and_then(|mut dst| {
+                                    copy_buffered(&mut src, &mut dst, self.options.bwlimit)
+                                })
                         })
                 };
             match copy_res {
-                Ok(copied) => total_stats.literal_bytes += copied,
+                Ok(copied) => {
+                    if copied < entry.metadata.size {
+                        let _ = fs::remove_file(&tmp_path);
+                        eprintln!(
+                            "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                            entry.source_path.display()
+                        );
+                        return Err(FsError::PartialTransfer);
+                    }
+                    total_stats.literal_bytes += copied;
+                }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp_path);
                     return Err(FsError::Io(e));
@@ -2168,6 +2244,15 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
+            if (source.len() as u64) < entry.metadata.size {
+                let _ = fs::remove_file(&staged_file);
+                eprintln!(
+                    "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                    entry.source_path.display()
+                );
+                return Err(FsError::PartialTransfer);
+            }
+
             let mut f = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -2196,9 +2281,19 @@ impl SyncEngine {
                             .create(true)
                             .truncate(true)
                             .open(&staged_file)
-                            .and_then(|mut dst| copy_buffered(&mut src, &mut dst))
+                            .and_then(|mut dst| {
+                                copy_buffered(&mut src, &mut dst, self.options.bwlimit)
+                            })
                     })?
             };
+            if copied < entry.metadata.size {
+                let _ = fs::remove_file(&staged_file);
+                eprintln!(
+                    "rsync: [sender] read errors mapping \"{}\": No data available (61)",
+                    entry.source_path.display()
+                );
+                return Err(FsError::PartialTransfer);
+            }
             total_stats.literal_bytes += copied;
         }
 

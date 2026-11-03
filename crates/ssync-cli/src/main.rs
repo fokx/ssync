@@ -1119,6 +1119,7 @@ fn main() {
         no_h: cli.no_h,
         progress: cli.progress,
         eight_bit_output: cli.eight_bit_output,
+        bwlimit: cli.bwlimit.as_deref().and_then(parse_bwlimit),
     };
 
     let engine = SyncEngine::new(sync_opts);
@@ -1155,4 +1156,36 @@ fn main() {
         );
         process::exit(23);
     }
+}
+
+fn parse_bwlimit(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut num_end = 0;
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_digit() || c == '.' {
+            num_end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if num_end == 0 {
+        return None;
+    }
+    let num_str = &s[..num_end];
+    let val: f64 = num_str.parse().ok()?;
+    if val <= 0.0 {
+        return None;
+    }
+    let suffix = s[num_end..].trim().to_ascii_lowercase();
+    let mult: f64 = match suffix.as_str() {
+        "" | "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "b" => 1.0,
+        _ => 1024.0,
+    };
+    Some((val * mult) as u64)
 }

@@ -725,3 +725,64 @@ fn test_inplace_and_append_behavior() {
     engine_inplace.execute(&entries_shrink, &dest).unwrap();
     assert_eq!(fs::read(dest.join("shrink.bin")).unwrap(), b"short content");
 }
+
+#[test]
+fn test_bwlimit_and_source_size_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    // 1. Test bwlimit throttling
+    let test_bytes = vec![0x55u8; 100_000]; // 100 KB
+    fs::write(src.join("throttled.bin"), &test_bytes).unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let entries = walker
+        .scan_sources(&[SourcePath::from_raw(
+            src.join("throttled.bin").to_str().unwrap(),
+        )])
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let sync_opts = SyncOptions {
+        bwlimit: Some(500 * 1024), // 500 KB/s => 100 KB takes ~200ms
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "bwlimit did not throttle transfer: took {:?}",
+        elapsed
+    );
+    assert_eq!(fs::read(dest.join("throttled.bin")).unwrap(), test_bytes);
+
+    // 2. Test source file diminishing mid-transfer produces PartialTransfer error while syncing remaining files
+    fs::write(src.join("01-shrunk.bin"), vec![0xAAu8; 10_000]).unwrap();
+    fs::write(src.join("02-intact.bin"), b"intact file content\n").unwrap();
+
+    let multi_entries = walker
+        .scan_sources(&[
+            SourcePath::from_raw(src.join("01-shrunk.bin").to_str().unwrap()),
+            SourcePath::from_raw(src.join("02-intact.bin").to_str().unwrap()),
+        ])
+        .unwrap();
+
+    // Truncate 01-shrunk.bin AFTER scanning
+    fs::write(src.join("01-shrunk.bin"), b"short").unwrap();
+
+    let normal_engine = SyncEngine::new(SyncOptions::default());
+    let res = normal_engine.execute(&multi_entries, &dest);
+    assert!(res.is_err());
+    // Later file must still have transferred
+    assert_eq!(
+        fs::read(dest.join("02-intact.bin")).unwrap(),
+        b"intact file content\n"
+    );
+}
