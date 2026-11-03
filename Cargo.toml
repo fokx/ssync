@@ -8,7 +8,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -33,6 +33,6 @@ tempfile = "3.17"
 proptest = "1.6"
 
 # Workspace crate references
-ssync-core = { version = "0.2.0", path = "crates/ssync-core" }
-ssync-fs = { version = "0.2.0", path = "crates/ssync-fs" }
-ssync-proto = { version = "0.2.0", path = "crates/ssync-proto" }
+ssync-core = { version = "0.3.0", path = "crates/ssync-core" }
+ssync-fs = { version = "0.3.0", path = "crates/ssync-fs" }
+ssync-proto = { version = "0.3.0", path = "crates/ssync-proto" }
