@@ -398,6 +398,15 @@ d1/d2/d3/f3
     assert!(dest.join("file").is_file());
     assert_eq!(fs::read(dest.join("file")).unwrap(), b"in-src-file");
 
+    // Test scan_from_lines directly
+    let parsed_lines = vec!["file".to_string(), "d1/f1".to_string()];
+    let entries_from_lines = walker.scan_from_lines(&src_path, &parsed_lines).unwrap();
+    let dest2 = tmp.path().join("dest2");
+    engine.execute(&entries_from_lines, &dest2).unwrap();
+    assert!(dest2.join("file").is_file());
+    assert!(dest2.join("d1/f1").is_file());
+    assert!(!dest2.join("d1/d2/d3/f3").exists());
+
     assert!(dest.join("d1/f1").is_file());
     assert_eq!(fs::read(dest.join("d1/f1")).unwrap(), b"f1");
 

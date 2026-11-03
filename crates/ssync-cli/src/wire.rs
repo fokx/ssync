@@ -79,6 +79,7 @@ pub fn run_wire_client(
     max_alloc: Option<&str>,
     remote_options: &[String],
     files_from: Option<&str>,
+    from0: bool,
     list_only: bool,
     backup: bool,
     backup_dir: Option<&str>,
@@ -197,8 +198,12 @@ pub fn run_wire_client(
     if let Some(ff) = files_from {
         if let Some(stripped) = ff.strip_prefix(':') {
             cmd.arg(format!("--files-from={}", stripped));
-        } else {
+            if from0 {
+                cmd.arg("--from0");
+            }
+        } else if !is_sender {
             cmd.arg("--files-from=-");
+            cmd.arg("--from0");
         }
     }
 
@@ -256,6 +261,7 @@ pub fn run_wire_client(
             false,
             itemize,
             files_from,
+            from0,
             list_only,
             relative,
         )?;
@@ -278,6 +284,8 @@ pub fn run_wire_client(
             bd_path,
             "~",
             link_dest,
+            files_from,
+            from0,
         )?;
     }
 
@@ -302,6 +310,7 @@ pub fn run_wire_server(
     perms: bool,
     times: bool,
     files_from: Option<&str>,
+    from0: bool,
     backup: bool,
     backup_dir: Option<PathBuf>,
     suffix: String,
@@ -365,6 +374,7 @@ pub fn run_wire_server(
             true,
             itemize,
             files_from,
+            from0,
             list_only,
             relative,
         )?;
@@ -389,6 +399,8 @@ pub fn run_wire_server(
             backup_dir.as_deref(),
             &suffix,
             link_dest,
+            files_from,
+            from0,
         )?;
     }
 
@@ -405,13 +417,15 @@ fn report_info<W: Write>(is_server: bool, writer: &mut MplexWriter<W>, msg: &str
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_send<R: Read, W: Write>(
     sources: &[String],
     reader: &mut MplexReader<R>,
     writer: &mut MplexWriter<W>,
-    _is_server: bool,
+    is_server: bool,
     _itemize: bool,
     files_from: Option<&str>,
+    from0: bool,
     list_only: bool,
     relative: bool,
 ) -> Result<()> {
@@ -430,8 +444,31 @@ fn wire_send<R: Read, W: Write>(
     let walker = Walker::new(walk_opts);
     let source_paths: Vec<SourcePath> = sources.iter().map(|s| SourcePath::from_raw(s)).collect();
     let transfer_entries = if let Some(ff) = files_from {
-        if !source_paths.is_empty() {
-            walker.scan_files_from(&source_paths[0], ff, false)?
+        if ff == "-" && is_server {
+            // Read null-terminated filenames from wire reader
+            let mut wire_lines = Vec::new();
+            let mut cur_buf = Vec::new();
+            let mut byte_buf = [0u8; 1];
+            loop {
+                reader.read_exact(&mut byte_buf)?;
+                if byte_buf[0] == 0 {
+                    if cur_buf.is_empty() {
+                        break;
+                    }
+                    wire_lines.push(String::from_utf8_lossy(&cur_buf).to_string());
+                    cur_buf.clear();
+                } else {
+                    cur_buf.push(byte_buf[0]);
+                }
+            }
+            let src = if !source_paths.is_empty() {
+                &source_paths[0]
+            } else {
+                &SourcePath::from_raw(".")
+            };
+            walker.scan_from_lines(src, &wire_lines)?
+        } else if !source_paths.is_empty() {
+            walker.scan_files_from(&source_paths[0], ff, from0)?
         } else {
             walker.scan_sources(&source_paths)?
         }
@@ -573,12 +610,50 @@ fn wire_recv<R: Read, W: Write>(
     backup_dir: Option<&Path>,
     suffix: &str,
     link_dest: &[String],
+    files_from: Option<&str>,
+    from0: bool,
 ) -> Result<()> {
     // 1. Read filter list (0 means empty)
     let filter_len = read_int(reader)?;
     if filter_len != 0 {
         let mut discard = vec![0u8; filter_len as usize];
         reader.read_exact(&mut discard)?;
+    }
+
+    // If client is receiver and has files_from, stream filenames null-terminated to sender
+    if !is_server {
+        if let Some(ff) = files_from {
+            let raw_data = if ff == "-" {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+                buf
+            } else {
+                std::fs::read(ff)?
+            };
+
+            let lines: Vec<String> = if from0 {
+                raw_data
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).to_string())
+                    .collect()
+            } else {
+                let text = String::from_utf8_lossy(&raw_data);
+                text.lines().map(|s| s.to_string()).collect()
+            };
+
+            for line in lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                    continue;
+                }
+                writer.write_all(trimmed.as_bytes())?;
+                writer.write_all(b"\0")?;
+            }
+            // Send empty string to terminate files-from list
+            writer.write_all(b"\0")?;
+            writer.flush()?;
+        }
     }
 
     // 2. Receive file list

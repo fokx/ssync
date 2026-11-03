@@ -117,6 +117,15 @@ impl Walker {
             text.lines().map(|s| s.to_string()).collect()
         };
 
+        self.scan_from_lines(source, &lines)
+    }
+
+    /// Scans a file list from pre-parsed line entries (e.g. from `--files-from` or wire stream).
+    pub fn scan_from_lines(
+        &self,
+        source: &SourcePath,
+        lines: &[String],
+    ) -> Result<Vec<TransferEntry>, FsError> {
         let mut entries = Vec::new();
         let mut seen_dest_paths = HashSet::new();
 
