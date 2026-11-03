@@ -274,6 +274,22 @@ fn format_thousands(mut n: u64) -> String {
     parts.join(",")
 }
 
+const WRITE_BUFFER_SIZE: usize = 256 * 1024;
+
+fn copy_buffered<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> std::io::Result<u64> {
+    let mut buffer = vec![0u8; WRITE_BUFFER_SIZE];
+    let mut total = 0;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 fn copy_sparse(reader: &mut File, writer: &mut File, total_len: u64) -> std::io::Result<u64> {
     let mut buffer = [0u8; 8192];
     let mut pending_zeros = 0u64;
@@ -1870,7 +1886,7 @@ impl SyncEngine {
         let mut dst_file = OpenOptions::new().write(true).open(dest_path)?;
         dst_file.seek(SeekFrom::Start(dst_len))?;
 
-        let appended = std::io::copy(&mut src_file, &mut dst_file)?;
+        let appended = copy_buffered(&mut src_file, &mut dst_file)?;
         dst_file.flush()?;
         total_stats.literal_bytes += appended;
 
@@ -1886,7 +1902,7 @@ impl SyncEngine {
                     .write(true)
                     .truncate(true)
                     .open(dest_path)?;
-                let full_copied = std::io::copy(&mut full_src, &mut full_dst)?;
+                let full_copied = copy_buffered(&mut full_src, &mut full_dst)?;
                 full_dst.flush()?;
                 total_stats.literal_bytes += full_copied;
             }
@@ -1936,35 +1952,40 @@ impl SyncEngine {
             let reconstructed = reconstruct_file(&basis, &tokens, sums.block_len)
                 .map_err(|e| FsError::Io(std::io::Error::other(e.to_string())))?;
 
+            let existing_len = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
             let open_res = OpenOptions::new()
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(false)
                 .open(dest_path);
             let mut f = match open_res {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => OpenOptions::new()
                     .write(true)
-                    .truncate(true)
                     .open(dest_path)
                     .map_err(|_| FsError::Io(e))?,
                 Err(e) => return Err(FsError::Io(e)),
             };
-            f.write_all(&reconstructed)?;
+            for chunk in reconstructed.chunks(WRITE_BUFFER_SIZE) {
+                f.write_all(chunk)?;
+            }
+            if (reconstructed.len() as u64) < existing_len {
+                f.set_len(reconstructed.len() as u64)?;
+            }
             f.flush()?;
         } else {
             let mut src_file =
                 safe_open_source(&entry.source_path, entry.source_root.as_deref(), follow)?;
+            let existing_len = dest_path.metadata().map(|m| m.len()).unwrap_or(0);
             let open_res = OpenOptions::new()
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(false)
                 .open(dest_path);
             let mut dst_file = match open_res {
                 Ok(file) => file,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => OpenOptions::new()
                     .write(true)
-                    .truncate(true)
                     .open(dest_path)
                     .map_err(|_| FsError::Io(e))?,
                 Err(e) => return Err(FsError::Io(e)),
@@ -1972,8 +1993,11 @@ impl SyncEngine {
             let copied = if self.options.sparse {
                 copy_sparse(&mut src_file, &mut dst_file, entry.metadata.size)?
             } else {
-                std::io::copy(&mut src_file, &mut dst_file)?
+                copy_buffered(&mut src_file, &mut dst_file)?
             };
+            if copied < existing_len {
+                dst_file.set_len(copied)?;
+            }
             dst_file.flush()?;
             total_stats.literal_bytes += copied;
         }
@@ -2060,7 +2084,7 @@ impl SyncEngine {
                                 .create(true)
                                 .truncate(true)
                                 .open(&tmp_path)
-                                .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
+                                .and_then(|mut dst| copy_buffered(&mut src, &mut dst))
                         })
                 };
             match copy_res {
@@ -2172,7 +2196,7 @@ impl SyncEngine {
                             .create(true)
                             .truncate(true)
                             .open(&staged_file)
-                            .and_then(|mut dst| std::io::copy(&mut src, &mut dst))
+                            .and_then(|mut dst| copy_buffered(&mut src, &mut dst))
                     })?
             };
             total_stats.literal_bytes += copied;

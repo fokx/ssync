@@ -672,3 +672,56 @@ fn test_walker_relative_shapes() {
     assert!(rel_paths.contains(&"sub/deep".to_string()));
     assert!(rel_paths.contains(&"sub".to_string()));
 }
+
+#[test]
+fn test_inplace_and_append_behavior() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    // 1. Test append transfer
+    let full_data = vec![0xABu8; 1024 * 1024]; // 1MB
+    fs::write(src.join("append.bin"), &full_data).unwrap();
+    fs::write(dest.join("append.bin"), &full_data[..256 * 1024]).unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let entries = walker
+        .scan_sources(&[SourcePath::from_raw(
+            src.join("append.bin").to_str().unwrap(),
+        )])
+        .unwrap();
+
+    let sync_opts = SyncOptions {
+        append: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+    assert_eq!(fs::read(dest.join("append.bin")).unwrap(), full_data);
+
+    // 2. Test inplace transfer where new file is shorter than old file
+    fs::write(src.join("shrink.bin"), b"short content").unwrap();
+    fs::write(
+        dest.join("shrink.bin"),
+        b"much longer content previously here",
+    )
+    .unwrap();
+
+    let entries_shrink = walker
+        .scan_sources(&[SourcePath::from_raw(
+            src.join("shrink.bin").to_str().unwrap(),
+        )])
+        .unwrap();
+    let sync_opts_inplace = SyncOptions {
+        inplace: true,
+        ..Default::default()
+    };
+    let engine_inplace = SyncEngine::new(sync_opts_inplace);
+    engine_inplace.execute(&entries_shrink, &dest).unwrap();
+    assert_eq!(fs::read(dest.join("shrink.bin")).unwrap(), b"short content");
+}
