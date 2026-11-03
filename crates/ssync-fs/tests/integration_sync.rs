@@ -786,3 +786,59 @@ fn test_bwlimit_and_source_size_change() {
         b"intact file content\n"
     );
 }
+
+#[test]
+fn test_backup_crossdev_copy_specials_and_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    let backup_dir = tmp.path().join("backup");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&backup_dir).unwrap();
+
+    // Regular file
+    fs::write(dest.join("reg"), b"old-content\n").unwrap();
+    fs::write(src.join("reg"), b"new-content-is-longer\n").unwrap();
+
+    // Symlink
+    std::os::unix::fs::symlink("target-old", dest.join("lnk")).unwrap();
+    std::os::unix::fs::symlink("target-new", src.join("lnk")).unwrap();
+
+    // FIFO
+    let fifo_path = dest.join("fifo");
+    let c_fifo = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+    let have_fifo = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o644) == 0 };
+    fs::write(src.join("fifo"), b"regular-replaces-fifo\n").unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        links: true,
+        ..Default::default()
+    });
+    let entries = walker
+        .scan_sources(&[SourcePath::from_raw(&format!("{}/", src.to_str().unwrap()))])
+        .unwrap();
+
+    let sync_opts = SyncOptions {
+        backup: true,
+        backup_dir: Some(backup_dir.clone()),
+        copy_links: false,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // Check backups
+    assert_eq!(fs::read(backup_dir.join("reg")).unwrap(), b"old-content\n");
+    assert!(backup_dir.join("lnk").is_symlink());
+    assert_eq!(
+        fs::read_link(backup_dir.join("lnk")).unwrap(),
+        std::path::PathBuf::from("target-old")
+    );
+    if have_fifo {
+        use std::os::unix::fs::FileTypeExt;
+        let meta = backup_dir.join("fifo").symlink_metadata().unwrap();
+        assert!(meta.file_type().is_fifo());
+    }
+}

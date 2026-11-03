@@ -1111,6 +1111,10 @@ impl SyncEngine {
                 if let Some(parent) = dest_path.parent() {
                     safe_create_dir_all(dest_root, parent)?;
                 }
+                if self.options.backup && dest_path.symlink_metadata().is_ok() {
+                    self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
+                }
+
                 if let Ok(meta) = dest_path.symlink_metadata() {
                     if meta.is_dir() {
                         let _ = fs::remove_dir(dest_path);
@@ -1157,6 +1161,10 @@ impl SyncEngine {
             if !self.options.dry_run {
                 if let Some(parent) = dest_path.parent() {
                     safe_create_dir_all(dest_root, parent)?;
+                }
+
+                if self.options.backup && dest_path.symlink_metadata().is_ok() {
+                    self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
                 }
 
                 if let Ok(meta) = dest_path.symlink_metadata() {
@@ -1281,7 +1289,7 @@ impl SyncEngine {
         };
 
         if let Some(parent) = backup_dest.parent() {
-            let _ = safe_create_dir_all(dest_root, parent);
+            let _ = fs::create_dir_all(parent);
         }
 
         if backup_dest.symlink_metadata().is_ok() {
@@ -1294,14 +1302,66 @@ impl SyncEngine {
 
         let orig_meta = FileMetadata::from_path(dest_path, false).ok();
 
-        if is_delete {
-            fs::rename(dest_path, &backup_dest)?;
-        } else if is_symlink {
+        let is_fifo = {
+            use std::os::unix::fs::FileTypeExt;
+            sym_meta.file_type().is_fifo()
+        };
+        let is_special = {
+            use std::os::unix::fs::FileTypeExt;
+            sym_meta.file_type().is_block_device() || sym_meta.file_type().is_char_device()
+        };
+
+        if is_symlink {
             if let Ok(target) = fs::read_link(dest_path) {
                 std::os::unix::fs::symlink(&target, &backup_dest)?;
+                if is_delete {
+                    let _ = fs::remove_file(dest_path);
+                }
+            }
+        } else if is_fifo {
+            let c_path = std::ffi::CString::new(backup_dest.as_os_str().as_encoded_bytes())
+                .map_err(|e| FsError::PathError(e.to_string()))?;
+            let mode = (sym_meta.permissions().mode() & 0o7777) | libc::S_IFIFO;
+            // SAFETY: c_path is a valid null-terminated C string.
+            let res = unsafe { libc::mknod(c_path.as_ptr(), mode as libc::mode_t, 0) };
+            if res != 0 {
+                return Err(FsError::Io(std::io::Error::last_os_error()));
+            }
+            if is_delete {
+                let _ = fs::remove_file(dest_path);
+            }
+        } else if is_special {
+            let c_path = std::ffi::CString::new(backup_dest.as_os_str().as_encoded_bytes())
+                .map_err(|e| FsError::PathError(e.to_string()))?;
+            let mode = sym_meta.permissions().mode() as libc::mode_t;
+            let dev = sym_meta.rdev() as libc::dev_t;
+            // SAFETY: c_path is a valid null-terminated C string.
+            let res = unsafe { libc::mknod(c_path.as_ptr(), mode, dev) };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(FsError::Io(err));
+                }
+            }
+            if is_delete {
+                let _ = fs::remove_file(dest_path);
+            }
+        } else if is_delete {
+            if let Err(e) = fs::rename(dest_path, &backup_dest) {
+                if e.raw_os_error() == Some(libc::EXDEV)
+                    || e.kind() == std::io::ErrorKind::CrossesDevices
+                {
+                    fs::copy(dest_path, &backup_dest)?;
+                    fs::remove_file(dest_path)?;
+                } else {
+                    return Err(FsError::Io(e));
+                }
             }
         } else {
-            fs::copy(dest_path, &backup_dest)?;
+            let link_res = fs::hard_link(dest_path, &backup_dest);
+            if link_res.is_err() {
+                fs::copy(dest_path, &backup_dest)?;
+            }
         }
 
         if let Some(meta) = orig_meta {
@@ -1437,6 +1497,10 @@ impl SyncEngine {
                 if let Some(parent) = dest_path.parent() {
                     safe_create_dir_all(dest_root, parent)?;
                 }
+                if self.options.backup && dest_path.symlink_metadata().is_ok() {
+                    self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
+                }
+
                 if let Ok(meta) = dest_path.symlink_metadata() {
                     if meta.is_dir() {
                         let _ = fs::remove_dir(dest_path);
@@ -2312,6 +2376,9 @@ impl SyncEngine {
                 safe_create_dir_all(dest_root, parent)?;
             }
             if dest_path.symlink_metadata().is_ok() {
+                if self.options.backup {
+                    self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
+                }
                 let _ = fs::remove_file(dest_path);
             }
             let c_path = std::ffi::CString::new(dest_path.as_os_str().as_encoded_bytes())
