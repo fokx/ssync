@@ -26,6 +26,7 @@ pub struct WalkOptions {
     pub min_size: Option<u64>,
     pub prune_empty_dirs: bool,
     pub verbose: u8,
+    pub confine_root: Option<PathBuf>,
 }
 
 /// Represents an item scheduled for transfer.
@@ -44,7 +45,10 @@ pub struct Walker {
 }
 
 impl Walker {
-    pub fn new(options: WalkOptions) -> Self {
+    pub fn new(mut options: WalkOptions) -> Self {
+        if options.filters.confine_root.is_none() && options.confine_root.is_some() {
+            options.filters.confine_root = options.confine_root.clone();
+        }
         Self {
             options,
             had_error: std::sync::atomic::AtomicBool::new(false),

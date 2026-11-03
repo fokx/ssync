@@ -757,19 +757,23 @@ fn main() {
 
     // Set up filter rules
     let mut filters = FilterSet::new();
+    filters.confine_root = cli.confine_root.clone();
     if let Some(ref d) = cli.debug {
         if d.contains("FILTER") || d.contains("all") {
             filters.debug_filter = true;
         }
     }
 
+    let mut filter_rules = Vec::new();
     if cli.filter_rsync >= 1 {
+        filter_rules.push(": /.rsync-filter".to_string());
         if let Err(e) = filters.add_filter_arg(": /.rsync-filter") {
             eprintln!("ssync: {}", e);
             process::exit(1);
         }
     }
     if cli.filter_rsync >= 2 {
+        filter_rules.push("- .rsync-filter".to_string());
         if let Err(e) = filters.add_filter_arg("- .rsync-filter") {
             eprintln!("ssync: {}", e);
             process::exit(1);
@@ -777,11 +781,14 @@ fn main() {
     }
 
     if cli.cvs_exclude {
+        filter_rules.push(":C".to_string());
+        filter_rules.push("-C".to_string());
         let _ = filters.add_filter_arg(":C");
         filters.add_cvs_excludes();
     }
 
     for arg in &cli.filter {
+        filter_rules.push(arg.clone());
         if let Err(e) = filters.add_filter_arg(arg) {
             eprintln!("ssync: {}", e);
             if e.contains("depth limit") {
@@ -805,6 +812,7 @@ fn main() {
     }
 
     for inc in &cli.include {
+        filter_rules.push(format!("+ {}", inc));
         filters.add_include(inc);
     }
 
@@ -821,6 +829,7 @@ fn main() {
     }
 
     for exc in &cli.exclude {
+        filter_rules.push(format!("- {}", exc));
         filters.add_exclude(exc);
     }
 
@@ -844,6 +853,7 @@ fn main() {
             cli.list_only,
             cli.relative,
             &cli.link_dest,
+            cli.confine_root.as_deref(),
         ) {
             eprintln!("ssync [server]: {:#}", e);
             process::exit(1);
@@ -902,6 +912,9 @@ fn main() {
             &cli.copy_dest,
             &cli.compare_dest,
             cli.relative,
+            &filter_rules,
+            &filters,
+            cli.confine_root.as_deref(),
         ) {
             eprintln!("ssync [client]: {:#}", e);
             process::exit(1);
@@ -983,6 +996,7 @@ fn main() {
         min_size,
         prune_empty_dirs: cli.prune_empty_dirs,
         verbose: cli.verbose,
+        confine_root: cli.confine_root.clone(),
     };
 
     let walker = Walker::new(walk_opts);

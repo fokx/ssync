@@ -12,7 +12,7 @@ pub struct SourcePath {
 
 impl SourcePath {
     pub fn from_raw(s: &str) -> Self {
-        let has_trailing_slash = s.ends_with('/') || s.ends_with("/.");
+        let has_trailing_slash = s.ends_with('/') || s.ends_with("/.") || s == ".";
         let trimmed = s.trim_end_matches('/');
         let path = if trimmed.is_empty() {
             PathBuf::from("/")
@@ -182,6 +182,9 @@ mod tests {
 
         let p4 = SourcePath::from_raw("dir/.");
         assert!(p4.has_trailing_slash);
+
+        let p5 = SourcePath::from_raw(".");
+        assert!(p5.has_trailing_slash);
     }
 
     #[test]

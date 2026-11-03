@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use ssync_core::checksum::{ChecksumAlgorithm, RollingChecksum, calculate_strong_checksum};
 use ssync_core::delta::{BlockSignature, DeltaToken, SumStruct, generate_delta};
+use ssync_fs::filter::FilterSet;
 use ssync_fs::metadata::{FileMetadata, FileType};
 use ssync_fs::path::SourcePath;
 use ssync_fs::walker::{WalkOptions, Walker};
@@ -93,6 +94,9 @@ pub fn run_wire_client(
     copy_dest: &[String],
     compare_dest: &[String],
     relative: bool,
+    filter_rules: &[String],
+    filters: &FilterSet,
+    confine_root: Option<&Path>,
 ) -> Result<()> {
     // Determine remote side
     let dest_remote = parse_remote_path(dest_raw);
@@ -252,6 +256,14 @@ pub fn run_wire_client(
     let mut reader = MplexReader::new(stdout);
     let mut writer = MplexWriter::new(stdin);
 
+    // Client sends filter list to server
+    for rule in filter_rules {
+        write_int(&mut writer, rule.len() as i32)?;
+        writer.write_all(rule.as_bytes())?;
+    }
+    write_int(&mut writer, 0)?;
+    writer.flush()?;
+
     if is_sender {
         // Client is SENDER, remote server is RECEIVER
         wire_send(
@@ -264,6 +276,8 @@ pub fn run_wire_client(
             from0,
             list_only,
             relative,
+            filters,
+            confine_root,
         )?;
     } else {
         // Client is RECEIVER, remote server is SENDER
@@ -317,6 +331,7 @@ pub fn run_wire_server(
     list_only: bool,
     relative: bool,
     link_dest: &[String],
+    confine_root: Option<&Path>,
 ) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -361,6 +376,20 @@ pub fn run_wire_server(
     let mut reader = MplexReader::new(stdin);
     let mut writer = MplexWriter::new(stdout);
 
+    // Server receives filter list from client right after handshake
+    let mut filter_set = FilterSet::new();
+    filter_set.confine_root = confine_root.map(|p| p.to_path_buf());
+    loop {
+        let len = read_int(&mut reader)?;
+        if len == 0 {
+            break;
+        }
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf)?;
+        let rule_str = String::from_utf8_lossy(&buf);
+        let _ = filter_set.add_filter_arg(&rule_str);
+    }
+
     if is_sender {
         let targets = if effective_paths.len() > 1 {
             &effective_paths[1..]
@@ -377,6 +406,8 @@ pub fn run_wire_server(
             from0,
             list_only,
             relative,
+            &filter_set,
+            confine_root,
         )?;
     } else {
         let (target_dir, dest_raw) = if effective_paths.len() > 1 {
@@ -428,17 +459,17 @@ fn wire_send<R: Read, W: Write>(
     from0: bool,
     list_only: bool,
     relative: bool,
+    filters: &FilterSet,
+    confine_root: Option<&Path>,
 ) -> Result<()> {
-    // 1. Send empty filter list
-    write_int(writer, 0)?;
-    writer.flush()?;
-
-    // 2. Scan and build file list using Walker
+    // Scan and build file list using Walker
     let walk_opts = WalkOptions {
         recursive: true,
         dirs: true,
         links: true,
         relative,
+        filters: filters.clone(),
+        confine_root: confine_root.map(|p| p.to_path_buf()),
         ..Default::default()
     };
     let walker = Walker::new(walk_opts);
@@ -613,13 +644,6 @@ fn wire_recv<R: Read, W: Write>(
     files_from: Option<&str>,
     from0: bool,
 ) -> Result<()> {
-    // 1. Read filter list (0 means empty)
-    let filter_len = read_int(reader)?;
-    if filter_len != 0 {
-        let mut discard = vec![0u8; filter_len as usize];
-        reader.read_exact(&mut discard)?;
-    }
-
     // If client is receiver and has files_from, stream filenames null-terminated to sender
     if !is_server {
         if let Some(ff) = files_from {

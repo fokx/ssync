@@ -570,7 +570,15 @@ fn test_filter_merge_redaction_and_recursion_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let loop_file = tmp.path().join("loop.filter");
     fs::write(&loop_file, format!(". {}\n", loop_file.display())).unwrap();
-    let res = filters.load_filter_file(&loop_file, tmp.path(), Path::new(""), 32, &RuleOrigin::Arg);
+    let res = filters.load_filter_file(
+        &loop_file,
+        tmp.path(),
+        Path::new(""),
+        32,
+        &RuleOrigin::Arg,
+        false,
+        ssync_fs::filter::RuleAction::Exclude,
+    );
     // Depth 32 is rejected
     assert!(res.is_err() || true);
 }
@@ -892,4 +900,40 @@ fn test_partial_dir_delta_resume_and_cleanup() {
 
     // 3. Empty partial dir should be cleaned up
     assert!(!partial_dir.exists());
+}
+
+#[test]
+fn test_confine_root_merge_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let outside = tmp.path().join("outside-secret");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(&outside, b"secretword\n").unwrap();
+    fs::write(root.join("secretword"), b"secret content").unwrap();
+    fs::write(root.join("keep"), b"keep content").unwrap();
+
+    let mut filter_set = FilterSet::new();
+    filter_set.confine_root = Some(root.clone());
+    filter_set.add_filter_arg(":-s ../outside-secret").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        filters: filter_set,
+        confine_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", root.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let engine = SyncEngine::new(SyncOptions::default());
+    engine.execute(&entries, &dest).unwrap();
+
+    // Out-of-root merge file must NOT be read, so secretword is NOT excluded
+    assert!(dest.join("secretword").is_file());
+    assert!(dest.join("keep").is_file());
 }

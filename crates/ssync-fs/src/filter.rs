@@ -359,6 +359,7 @@ pub struct FilterSet {
     rules: Vec<FilterRule>,
     dir_merge_rules: Vec<DirMergeRule>,
     pub debug_filter: bool,
+    pub confine_root: Option<PathBuf>,
 }
 
 impl FilterSet {
@@ -367,6 +368,7 @@ impl FilterSet {
             rules: Vec::new(),
             dir_merge_rules: Vec::new(),
             debug_filter: false,
+            confine_root: None,
         }
     }
 
@@ -407,9 +409,22 @@ impl FilterSet {
         rel_dir: &Path,
         depth: usize,
         origin: &RuleOrigin,
+        no_prefixes: bool,
+        default_action: RuleAction,
     ) -> Result<(), String> {
         if depth >= 32 {
             return Err("merge-file include depth limit (32) exceeded".to_string());
+        }
+        if let Some(ref root) = self.confine_root {
+            let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            match path.canonicalize() {
+                Ok(cp) => {
+                    if !cp.starts_with(&canon_root) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
         }
         let file = match fs::File::open(path) {
             Ok(f) => f,
@@ -454,7 +469,12 @@ impl FilterSet {
                 },
                 RuleOrigin::UnknownFile => RuleOrigin::UnknownFile,
             };
-            if let Err(e) = self.parse_filter_rule(trimmed, fs_dir, rel_dir, depth, &cur_origin) {
+            if no_prefixes {
+                let rule = Self::parse_rule(trimmed, default_action, false, rel_dir, &cur_origin);
+                self.rules.push(rule);
+            } else if let Err(e) =
+                self.parse_filter_rule(trimmed, fs_dir, rel_dir, depth, &cur_origin)
+            {
                 eprintln!("{}", e);
                 if e.contains("depth limit") {
                     std::process::exit(11);
@@ -777,6 +797,8 @@ impl FilterSet {
                         rel_dir,
                         depth + 1,
                         &child_origin,
+                        no_prefixes,
+                        default_action,
                     )?;
                 }
             }
@@ -950,6 +972,18 @@ impl FilterSet {
                 continue;
             }
 
+            if let Some(ref root) = self.confine_root {
+                let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                match merge_file_path.canonicalize() {
+                    Ok(cm) => {
+                        if !cm.starts_with(&canon_root) {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
             if merge_file_path.is_file() {
                 if let Ok(file) = fs::File::open(&merge_file_path) {
                     let mut file_rules = Vec::new();
@@ -1013,6 +1047,7 @@ impl FilterSet {
                         } else {
                             let mut local_set = FilterSet::new();
                             local_set.debug_filter = self.debug_filter;
+                            local_set.confine_root = self.confine_root.clone();
                             match local_set.parse_filter_rule(
                                 trimmed,
                                 dir_path,
