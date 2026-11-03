@@ -299,6 +299,10 @@ struct Cli {
     #[arg(long = "debug")]
     debug: Option<String>,
 
+    /// Delay creation of symlinks until end of transfer
+    #[arg(long = "delay-symlinks")]
+    delay_symlinks: bool,
+
     /// Fine-grained informational output
     #[arg(long = "info")]
     info: Option<String>,
@@ -854,6 +858,8 @@ fn main() {
             cli.relative,
             &cli.link_dest,
             cli.confine_root.as_deref(),
+            cli.ignore_existing,
+            cli.delay_symlinks,
         ) {
             eprintln!("ssync [server]: {:#}", e);
             process::exit(1);
@@ -915,6 +921,9 @@ fn main() {
             &filter_rules,
             &filters,
             cli.confine_root.as_deref(),
+            cli.ignore_existing,
+            cli.delay_symlinks,
+            cli.suffix.as_deref(),
         ) {
             eprintln!("ssync [client]: {:#}", e);
             process::exit(1);
@@ -1111,6 +1120,7 @@ fn main() {
         no_whole_file: cli.no_whole_file,
         whole_file: cli.whole_file,
         stats: cli.stats,
+        delay_symlinks: cli.delay_symlinks,
         debug: cli.debug,
         info: cli.info,
         log_file: cli.log_file.map(PathBuf::from),

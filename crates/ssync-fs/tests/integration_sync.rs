@@ -937,3 +937,75 @@ fn test_confine_root_merge_file() {
     assert!(dest.join("secretword").is_file());
     assert!(dest.join("keep").is_file());
 }
+
+#[test]
+fn test_delay_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    let target = src.join("real_file");
+    fs::write(&target, b"content").unwrap();
+    std::os::unix::fs::symlink("real_file", src.join("link_to_real")).unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        links: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        delay_symlinks: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    assert_eq!(fs::read(dest.join("real_file")).unwrap(), b"content");
+    let link_dest = fs::read_link(dest.join("link_to_real")).unwrap();
+    assert_eq!(link_dest.to_str().unwrap(), "real_file");
+}
+
+#[test]
+fn test_backup_deletion_with_ignore_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    // Source has a file named "foo~" (backup name collision candidate)
+    fs::write(src.join("foo~"), b"source foo~").unwrap();
+
+    // Dest has an old file "foo" that does not exist in src, so it will be deleted
+    fs::write(dest.join("foo"), b"old live foo").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        delete: true,
+        backup: true,
+        ignore_existing: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // The deleted "foo" is backed up to "foo~" before src's "foo~" can overwrite it.
+    // Because ignore_existing is true, the created backup "foo~" preserves the old file's content!
+    assert!(!dest.join("foo").exists());
+    assert_eq!(fs::read(dest.join("foo~")).unwrap(), b"old live foo");
+}

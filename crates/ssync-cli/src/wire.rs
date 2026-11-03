@@ -97,6 +97,9 @@ pub fn run_wire_client(
     filter_rules: &[String],
     filters: &FilterSet,
     confine_root: Option<&Path>,
+    ignore_existing: bool,
+    delay_symlinks: bool,
+    suffix: Option<&str>,
 ) -> Result<()> {
     // Determine remote side
     let dest_remote = parse_remote_path(dest_raw);
@@ -168,8 +171,17 @@ pub fn run_wire_client(
     if backup {
         cmd.arg("-b");
     }
+    if let Some(s) = suffix {
+        cmd.arg(format!("--suffix={}", s));
+    }
     if let Some(bd) = backup_dir {
         cmd.arg(format!("--backup-dir={}", bd));
+    }
+    if ignore_existing {
+        cmd.arg("--ignore-existing");
+    }
+    if delay_symlinks {
+        cmd.arg("--delay-symlinks");
     }
     if partial {
         cmd.arg("--partial");
@@ -296,10 +308,12 @@ pub fn run_wire_client(
             list_only,
             backup,
             bd_path,
-            "~",
+            suffix.unwrap_or("~"),
             link_dest,
             files_from,
             from0,
+            ignore_existing,
+            delay_symlinks,
         )?;
     }
 
@@ -332,6 +346,8 @@ pub fn run_wire_server(
     relative: bool,
     link_dest: &[String],
     confine_root: Option<&Path>,
+    ignore_existing: bool,
+    delay_symlinks: bool,
 ) -> Result<()> {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -432,6 +448,8 @@ pub fn run_wire_server(
             link_dest,
             files_from,
             from0,
+            ignore_existing,
+            delay_symlinks,
         )?;
     }
 
@@ -444,6 +462,48 @@ fn report_info<W: Write>(is_server: bool, writer: &mut MplexWriter<W>, msg: &str
     } else {
         print!("{}", msg);
         let _ = std::io::stdout().flush();
+    }
+    Ok(())
+}
+
+fn create_symlink<W: Write>(
+    target_path: &Path,
+    entry: &WireFileEntry,
+    is_server: bool,
+    writer: &mut MplexWriter<W>,
+    itemize: bool,
+    perms: bool,
+    times: bool,
+) -> Result<()> {
+    if let Some(ref target) = entry.symlink_target {
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Ok(meta) = target_path.symlink_metadata() {
+            if meta.is_dir() {
+                let _ = fs::remove_dir(target_path);
+            } else {
+                let _ = fs::remove_file(target_path);
+            }
+        }
+        std::os::unix::fs::symlink(target, target_path)?;
+        if itemize {
+            report_info(
+                is_server,
+                writer,
+                &format!("cL+++++++++ {} -> {}\n", entry.name, target),
+            )?;
+        }
+    }
+    if let Ok(mut fs_meta) = FileMetadata::from_path(target_path, false) {
+        if perms {
+            fs_meta.mode = entry.mode;
+        }
+        if times {
+            fs_meta.mtime_sec = entry.mtime_secs;
+            fs_meta.mtime_nsec = entry.mtime_nanos as i64;
+        }
+        let _ = fs_meta.apply_to(target_path, perms, times, false, false);
     }
     Ok(())
 }
@@ -643,6 +703,8 @@ fn wire_recv<R: Read, W: Write>(
     link_dest: &[String],
     files_from: Option<&str>,
     from0: bool,
+    ignore_existing: bool,
+    delay_symlinks: bool,
 ) -> Result<()> {
     // If client is receiver and has files_from, stream filenames null-terminated to sender
     if !is_server {
@@ -732,9 +794,23 @@ fn wire_recv<R: Read, W: Write>(
 
         for p in on_disk {
             if !transferred_set.contains(&p) && p != dest_dir {
+                if backup && (p.is_file() || p.is_symlink()) {
+                    let rel = p.strip_prefix(dest_dir).unwrap_or(&p);
+                    let bak_path = if let Some(bd) = backup_dir {
+                        bd.join(rel)
+                    } else {
+                        let mut s = p.as_os_str().to_os_string();
+                        s.push(suffix);
+                        PathBuf::from(s)
+                    };
+                    if let Some(parent) = bak_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::rename(&p, &bak_path);
+                }
                 if p.is_dir() && !p.is_symlink() {
                     let _ = fs::remove_dir(&p);
-                } else {
+                } else if p.exists() || p.is_symlink() {
                     let _ = fs::remove_file(&p);
                 }
                 if itemize {
@@ -750,6 +826,7 @@ fn wire_recv<R: Read, W: Write>(
     }
 
     let mut dirs_to_update = Vec::new();
+    let mut deferred_symlinks = Vec::new();
 
     // 3. Process each entry
     for entry in &entries {
@@ -775,39 +852,28 @@ fn wire_recv<R: Read, W: Write>(
             continue;
         } else if file_type == 0o120000 {
             // Symlink
-            if let Some(ref target) = entry.symlink_target {
-                if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if let Ok(meta) = target_path.symlink_metadata() {
-                    if meta.is_dir() {
-                        let _ = fs::remove_dir(&target_path);
-                    } else {
-                        let _ = fs::remove_file(&target_path);
-                    }
-                }
-                std::os::unix::fs::symlink(target, &target_path)?;
-                if itemize {
-                    report_info(
-                        is_server,
-                        writer,
-                        &format!("cL+++++++++ {} -> {}\n", entry.name, target),
-                    )?;
-                }
+            if delay_symlinks {
+                deferred_symlinks.push((target_path.clone(), entry.clone()));
+                continue;
             }
-            if let Ok(mut fs_meta) = FileMetadata::from_path(&target_path, false) {
-                if perms {
-                    fs_meta.mode = entry.mode;
-                }
-                if times {
-                    fs_meta.mtime_sec = entry.mtime_secs;
-                    fs_meta.mtime_nsec = entry.mtime_nanos as i64;
-                }
-                let _ = fs_meta.apply_to(&target_path, perms, times, false, false);
+            if ignore_existing && (target_path.exists() || target_path.is_symlink()) {
+                continue;
             }
+            create_symlink(
+                &target_path,
+                entry,
+                is_server,
+                writer,
+                itemize,
+                perms,
+                times,
+            )?;
             continue;
         } else if file_type == 0o010000 {
             // FIFO / named pipe
+            if ignore_existing && (target_path.exists() || target_path.is_symlink()) {
+                continue;
+            }
             if let Some(parent) = target_path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
                     fs::create_dir_all(parent)?;
@@ -836,13 +902,15 @@ fn wire_recv<R: Read, W: Write>(
             continue;
         } else {
             // Regular file
+            let skip_update = ignore_existing && (target_path.exists() || target_path.is_symlink());
+
             if let Some(parent) = target_path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
                     fs::create_dir_all(parent)?;
                 }
             }
 
-            if backup && target_path.exists() {
+            if !skip_update && backup && target_path.exists() {
                 let bak_path = if let Some(bd) = backup_dir {
                     bd.join(&entry.name)
                 } else {
@@ -916,7 +984,7 @@ fn wire_recv<R: Read, W: Write>(
                     bail!("MD5 mismatch for file: {}", entry.name);
                 }
 
-                if reconstructed != basis {
+                if !skip_update && (reconstructed != basis || !target_path.exists()) {
                     let _ = fs::remove_file(&target_path);
                     fs::write(&target_path, &reconstructed)?;
                 }
@@ -944,25 +1012,37 @@ fn wire_recv<R: Read, W: Write>(
                     bail!("MD5 mismatch for file: {}", entry.name);
                 }
 
-                fs::write(&target_path, &reconstructed)?;
+                if !skip_update {
+                    fs::write(&target_path, &reconstructed)?;
+                }
             }
 
-            if itemize {
+            if !skip_update && itemize {
                 report_info(is_server, writer, &format!("<f+++++++++ {}\n", entry.name))?;
             }
-        }
 
-        // Apply metadata to non-directory file
-        if let Ok(mut fs_meta) = FileMetadata::from_path(&target_path, false) {
-            if perms {
-                fs_meta.mode = entry.mode;
+            // Apply metadata to non-directory file
+            if !skip_update {
+                if let Ok(mut fs_meta) = FileMetadata::from_path(&target_path, false) {
+                    if perms {
+                        fs_meta.mode = entry.mode;
+                    }
+                    if times {
+                        fs_meta.mtime_sec = entry.mtime_secs;
+                        fs_meta.mtime_nsec = entry.mtime_nanos as i64;
+                    }
+                    let _ = fs_meta.apply_to(&target_path, perms, times, false, false);
+                }
             }
-            if times {
-                fs_meta.mtime_sec = entry.mtime_secs;
-                fs_meta.mtime_nsec = entry.mtime_nanos as i64;
-            }
-            let _ = fs_meta.apply_to(&target_path, perms, times, false, false);
         }
+    }
+
+    // Create deferred symlinks
+    for (t_path, e) in deferred_symlinks {
+        if ignore_existing && (t_path.exists() || t_path.is_symlink()) {
+            continue;
+        }
+        create_symlink(&t_path, &e, is_server, writer, itemize, perms, times)?;
     }
 
     // Apply directory metadata in reverse post-order (deepest directories first)

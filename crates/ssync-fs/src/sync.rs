@@ -67,6 +67,7 @@ pub struct SyncOptions {
     pub no_whole_file: bool,
     pub whole_file: bool,
     pub stats: bool,
+    pub delay_symlinks: bool,
     pub debug: Option<String>,
     pub info: Option<String>,
     pub log_file: Option<PathBuf>,
@@ -866,6 +867,7 @@ impl SyncEngine {
         let mut total_stats = MatchStats::default();
         let mut had_partial_error = false;
 
+        let mut deferred_symlinks = Vec::new();
         for entry in entries {
             let dest_path = if entry.relative_dest_path.as_os_str().is_empty() {
                 dest_root.to_path_buf()
@@ -874,6 +876,11 @@ impl SyncEngine {
             };
 
             if self.options.existing && !dest_path.exists() {
+                continue;
+            }
+
+            if self.options.delay_symlinks && entry.metadata.file_type == FileType::Symlink {
+                deferred_symlinks.push(entry);
                 continue;
             }
 
@@ -909,6 +916,21 @@ impl SyncEngine {
                         had_partial_error = true;
                     }
                 }
+            }
+        }
+
+        for entry in deferred_symlinks {
+            let dest_path = if entry.relative_dest_path.as_os_str().is_empty() {
+                dest_root.to_path_buf()
+            } else {
+                dest_root.join(&entry.relative_dest_path)
+            };
+            if self.options.existing && !dest_path.exists() {
+                continue;
+            }
+            if let Err(e) = self.sync_symlink(entry, &dest_path, dest_root) {
+                eprintln!("ssync: {}: {}", dest_path.display(), e);
+                had_partial_error = true;
             }
         }
 
@@ -2601,11 +2623,16 @@ impl SyncEngine {
             }
 
             if !self.options.dry_run {
+                let eff_suffix = if self.options.suffix.is_empty() {
+                    "~"
+                } else {
+                    &self.options.suffix
+                };
                 let is_already_backup = self.options.backup_dir.is_none()
                     && full_path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map(|s| s.ends_with(&self.options.suffix))
+                        .map(|s| s.ends_with(eff_suffix))
                         .unwrap_or(false);
 
                 if self.options.backup && !is_dir && !is_already_backup {
