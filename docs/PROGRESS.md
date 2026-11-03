@@ -57,12 +57,12 @@ This document tracks implementation status across phases, records upstream test 
 | Metric | Start of Session | End of Session | Delta |
 |--------|------------------|----------------|-------|
 | **Total Tests** | 374 | 374 | 0 |
-| **Total Passed** | 123 | 148 | **+25** |
-| **Total Failed** | 139 | 114 | **-25** |
+| **Total Passed** | 148 | 159 | **+11** |
+| **Total Failed** | 114 | 103 | **-11** |
 | **Total Skipped** | 111 | 111 | 0 |
 | **Total Expected Fail (XFAIL)** | 1 | 1 | 0 |
-| **Required for v1 Passed** | 77 | 101 | **+24** |
-| **Required for v1 Failed** | 35 | 11 | **-24** |
+| **Required for v1 Passed** | 101 | 112 | **+11** |
+| **Required for v1 Failed** | 11 | 0 | **-11 (100% PASS)** |
 | **Required for v1 Skipped** | 9 | 9 | 0 |
 
 ### Skipped Required Tests Breakdown (9 tests)
@@ -146,56 +146,64 @@ This document tracks implementation status across phases, records upstream test 
 | `rrsync-receiver-file-arg` | Required | **Passed** | Commit `ae0902f` | Single-file destination pathing under pinned wire transfers |
 | `rrsync-root-relative-paths` | Required | **Passed** | Commit `ae0902f` | Wire server `--link-dest` basis hardlinking and root-relative paths |
 | `rrsync-pull-arg-shapes` | Required | **Passed** | Commit `ae0902f` | Trailing slash symlink directory dereference and wire FIFO encoding |
+| `append-abort-mid-write` | Required | **Passed** | Commit `fbe4340` | Buffer writes in 256KB chunks and avoid premature truncation in inplace mode |
+| `growing-file` | Required | **Passed** | Commit `c61c9fd` | Enforce `--bwlimit` rate limiting and ignore mid-transfer file growth |
+| `source-change-size-continues` | Required | **Passed** | Commit `c61c9fd` | Diagnose and skip mid-transfer diminished files cleanly |
+| `backup-crossdev-copy` | Required | **Passed** | Commit `c718e71` | Recreate symlinks, FIFOs, and special devices across devices on backup |
+| `partial` | Required | **Passed** | Commit `0f7242f` | Support `--partial` and `--partial-dir` staging, resumption, and cleanup |
+| `partial-protected-regular-retry-linux` | Required | **Passed** | Commit `0f7242f` | Resume partial files under `fs.protected_regular` sysctl |
+| `rrsync-files-from-stdin` | Required | **Passed** | Commit `6793568` | Stream null-terminated `--files-from=-` list over wire protocol |
+| `rrsync-merge-file-confine` | Required | **Passed** | Commit `6b66cfe` | Confine merge files and forward client filter rules over wire |
+| `rrsync-no-overwrite-delay-symlinks` | Required | **Passed** | Commit `44507b4` | Delay symlink creation until end of transfer (`--delay-symlinks`) |
+| `rrsync-no-overwrite-backup-collision` | Required | **Passed** | Commit `44507b4` | Preserve backup collision files on deletion under `--ignore-existing` |
+| `rrsync-sender-leaf-flip` | Required | **Passed** | Commit `32dddee` | Open sender sources with `O_NOFOLLOW` and signal `MsgCode::NoSend` on raced symlink flips |
+| `backup` | Required | **Passed** | Commit `11ca0b4` | Copy rather than hard-link files during inplace backups |
 
 *(Full mapping of all 374 upstream tests is maintained in `docs/TESTSUITE_MAP.md`)*
 
 ---
 
-## 3. Backlog: Remaining Required Failures (11 tests)
+## 3. Backlog: Remaining Required Failures (0 tests)
 
-- [ ] `append-abort-mid-write`: Signal handling (SIGINT/SIGTERM) mid-write during `--append` should cleanly flush and preserve partially appended content up to abort point without corrupting the basis file.
-- [ ] `backup-crossdev-copy`: When backup directory is on a different filesystem / mount point, ensure fallback copy and deletion handles `EXDEV` across device boundaries.
-- [ ] `growing-file`: Source file that grows concurrently while being read should transfer initial snapshot without crashing or reporting checksum failure.
-- [ ] `partial`: Resuming partial transfers with `--partial` and `--partial-dir`.
-- [ ] `partial-protected-regular-retry-linux`: Kernel `fs.protected_regular` interaction with partial temporary file naming and replacement.
-- [ ] `rrsync-files-from-stdin`: Wire protocol support for `--files-from=-` streaming path list from standard input over multiplexed channel.
-- [ ] `rrsync-merge-file-confine`: Restrict `.cvsignore` and per-dir merge files to stay strictly confined beneath restricted root.
-- [ ] `rrsync-no-overwrite-backup-collision`: Wire receiver handling of duplicate backup filenames.
-- [ ] `rrsync-no-overwrite-delay-symlinks`: Wire receiver staging and symlink updates under `--delay-updates`.
-- [ ] `rrsync-sender-leaf-flip`: Wire sender race condition defense when a leaf path is swapped with a symlink or directory mid-scan.
-- [ ] `source-change-size-continues`: Source file shrinking or growing during walker scan phase should log diagnostic and continue rather than panicking.
+**All 112 non-skipped Required-for-v1 upstream tests pass!**
+The remaining 9 tests in the Required category are skipped due to kernel/filesystem environment preconditions:
+- `acls-unpinnable` (SKIP): Requires POSIX ACL filesystem features not present on test tmpfs.
+- `atimes` (SKIP): Requires kernel/mount support for atime recording.
+- `crtimes` (SKIP): Requires filesystem birth time / creation time support (macOS/FreeBSD ext4/bflash).
+- `link-dest-symlink-enotsup` (SKIP): Requires filesystem that rejects symlink creation with ENOTSUP.
+- `macos-setgid-ordinary-mode-regression` (SKIP): macOS-specific setgid directory inheritance behavior.
+- `open-noatime` (SKIP): Requires `O_NOATIME` filesystem permission/support.
+- `partial-protected-regular-retry-policy` (SKIP): Advanced Linux protected_regular sysctl policy.
+- `preallocate` (SKIP): Requires underlying filesystem fallocate support.
+- `symlink-unix-perms` (SKIP): Unix symlink permissions support (platform dependent).
 
 ---
 
 ## 4. Notes for Next Session
 
 1. **Session Achievements**:
-   - Completed 10 root-cause fixes across 12 atomic commits.
-   - Required for v1 passing tests increased from **77 to 101** (+24 passing tests).
-   - Remaining Required failures reduced from **35 down to only 11**.
-   - Total upstream test suite pass count increased from **123 to 148** (+25 passing tests).
+   - Resolved all 11 remaining Required failures from the backlog plus 1 regression fix (`backup`), reaching **100% pass rate on all runnable Required-for-v1 tests** (112/112 passed, 9/9 skipped due to filesystem/kernel capability).
+   - Required for v1 passing tests increased from **101 to 112** (+11 passing tests, 0 failing).
+   - Total upstream test suite pass count increased from **148 to 159** (+11 passing tests).
    - Zero test regressions across the entire suite.
-   - All 47 Rust unit and integration tests passing (`cargo test`).
+   - All 50 Rust unit and integration tests passing (`cargo test`).
    - Codebase is 100% clean: `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` produce zero warnings or errors.
    - Upstream reference repository `/f/rsync` confirmed strictly unmodified.
 
 2. **Root Causes Fixed This Session**:
-   - **Commit `9805e37`**: In-tree symlinked parent traversal and `--keep-dirlinks` handling (fixed `relative-symlinked-parent`, `relative-symlinked-parent-dotdot`, `keep-dirlinks-rule`, `keep-dirlinks-symlinked-dest`, `no-implied-dirs-symlink`, `relative-implied-symlink`).
-   - **Commit `e3a9aa0`**: Standard CLI flags, executability preservation, control character sanitization in terminal/logs (fixed `missing`, `sparse`, `omit-times`, `stop-time`, `output-control-chars`, `log-control-chars`, `compress-options`, `executability`).
-   - **Commit `235e893`**: Follow operator-named symlinked destination directory (fixed `dest-symlinked-dir`).
-   - **Commit `6790952`**: Implementation of `--out-format`, itemized change percentages, summary stats block, `--list-only` (fixed `ki58-log-format-percent`, `output-options`).
-   - **Commit `f141217`**: Added `--files-from` and `--from0` with strict leading-slash stripping and path clamping (fixed `files-from-depth`, `files-from-path-clamp`, `rrsync-write-only-files-from`).
-   - **Commit `f2bffad`**: Backup symlink preservation and `--safe-links` enforcement (fixed `ki72-safe-links-backup`).
-   - **Commit `c8eb05d`**: Fuzzy basis candidate selection and Levenshtein/size heuristic distance scoring (fixed `fuzzy`, `fuzzy-basis`).
-   - **Commit `5022554`**: Merge-file recursion depth cap of 32, rule origin redaction in error messages, `-F` exclude-self origin inheritance, `-vv` sender match tracing (fixed `filter-depth`, `filter-merge-recursion`, `filter-merge-content-echo`).
-   - **Commit `0d15483`**: Command-line support for `--super` and `--no-super` (fixed `scanner-delete-delay-overread`).
-   - **Commit `55a997b`**: Catch `EACCES` on `OpenOptions::create(true)` and retry without create to satisfy Linux `fs.protected_regular` kernel sysctl (fixed `protected-regular`).
-   - **Commit `85add65`**: Forwarded wire client options (`--backup`, `--backup-dir`, `--partial`, `--delay-updates`, etc.) and added server-side backup creation and directory replacement by symlinks (fixed `rrsync-backup-dir-inband-pivot`, `rrsync-no-overwrite-partial-dir`, `rrsync-no-overwrite-logfile`).
-   - **Commit `ae0902f`**: Single-file destination pathing, `--link-dest` basis hardlinking, trailing slash symlink directory dereference, and wire FIFO/named pipe encoding (fixed `rrsync-receiver-file-arg`, `rrsync-root-relative-paths`, `rrsync-pull-arg-shapes`).
+   - **Commit `fbe4340`**: Buffered writes in 256KB chunks and avoided premature truncation in inplace mode (fixed `append-abort-mid-write`).
+   - **Commit `c61c9fd`**: Enforced `--bwlimit` rate limiting and diagnosed mid-transfer diminished files (fixed `growing-file`, `source-change-size-continues`).
+   - **Commit `c718e71`**: Recreated symlinks, FIFOs, and special devices on cross-device backup (fixed `backup-crossdev-copy`).
+   - **Commit `0f7242f`**: Supported `--partial` and `--partial-dir` staging, resume, and foreign symlink policy (fixed `partial`, `partial-protected-regular-retry-linux`).
+   - **Commit `6793568`**: Streamed and received null-terminated files-from list over wire protocol (fixed `rrsync-files-from-stdin`).
+   - **Commit `6b66cfe`**: Confined merge file opens and forwarded client filter rules over wire (fixed `rrsync-merge-file-confine`).
+   - **Commit `44507b4`**: Delayed symlink creation and preserved backup collisions with ignore-existing (fixed `rrsync-no-overwrite-delay-symlinks`, `rrsync-no-overwrite-backup-collision`).
+   - **Commit `32dddee`**: Opened wire sender sources with `O_NOFOLLOW` and signaled `MsgCode::NoSend` on raced symlink flips (fixed `rrsync-sender-leaf-flip`).
+   - **Commit `11ca0b4`**: Copied rather than hard-linked files during inplace backups (fixed `backup`).
 
 3. **Recommended Next Steps**:
-   - Work through the remaining 11 Required failures in `docs/PROGRESS.md`:
-     - Prioritize data-correctness & lifecycle: `append-abort-mid-write`, `growing-file`, and `source-change-size-continues`.
-     - Next, tackle `--partial` / `--partial-dir` support: `partial` and `partial-protected-regular-retry-linux`.
-     - Next, complete wire protocol edge cases: `rrsync-files-from-stdin`, `rrsync-merge-file-confine`, `rrsync-no-overwrite-backup-collision`, `rrsync-no-overwrite-delay-symlinks`, `rrsync-sender-leaf-flip`.
-     - Finally, address `backup-crossdev-copy` (`EXDEV` cross-device fallback).
+   - Begin tackling Deferred tests that are now within reach:
+     - `delay-symlinks` and `delay-symlinks-remote`: Validate the newly implemented `--delay-symlinks` wire/local flag against standalone tests.
+     - `files-from`: Validate edge cases with `--files-from` against remote servers.
+     - `symlink-dirlink-basis`: Verify alternate basis directories with symlinked directory targets.
+     - `hardlinks`: Wire protocol preservation of hardlink graphs.
