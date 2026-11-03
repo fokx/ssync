@@ -1042,3 +1042,51 @@ fn test_safe_open_source_refuses_symlink_leaf() {
     let err_noroot = res_noroot.unwrap_err();
     assert_eq!(err_noroot.raw_os_error(), Some(libc::ELOOP));
 }
+
+#[test]
+fn test_backup_with_inplace_does_not_hard_link() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    let bak = tmp.path().join("bak");
+
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+
+    fs::write(dest.join("file.txt"), b"initial content").unwrap();
+    fs::write(src.join("file.txt"), b"new modified content").unwrap();
+
+    let walk_opts = WalkOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let walker = Walker::new(walk_opts);
+    let sources = vec![SourcePath::from_raw(&format!("{}/", src.display()))];
+    let entries = walker.scan_sources(&sources).unwrap();
+
+    let sync_opts = SyncOptions {
+        inplace: true,
+        backup: true,
+        backup_dir: Some(bak.clone()),
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // Verify backup exists with old content
+    assert_eq!(fs::read(bak.join("file.txt")).unwrap(), b"initial content");
+    // Verify destination exists with new content
+    assert_eq!(
+        fs::read(dest.join("file.txt")).unwrap(),
+        b"new modified content"
+    );
+
+    // Verify nlink is 1 (they are NOT hard-linked together)
+    let dest_meta = fs::metadata(dest.join("file.txt")).unwrap();
+    let bak_meta = fs::metadata(bak.join("file.txt")).unwrap();
+    assert_eq!(dest_meta.nlink(), 1);
+    assert_eq!(bak_meta.nlink(), 1);
+    assert_ne!(dest_meta.ino(), bak_meta.ino());
+}

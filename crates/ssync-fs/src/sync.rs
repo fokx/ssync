@@ -1417,6 +1417,8 @@ impl SyncEngine {
                     return Err(FsError::Io(e));
                 }
             }
+        } else if self.options.inplace {
+            fs::copy(dest_path, &backup_dest)?;
         } else {
             let link_res = fs::hard_link(dest_path, &backup_dest);
             if link_res.is_err() {
