@@ -1120,6 +1120,8 @@ fn main() {
         progress: cli.progress,
         eight_bit_output: cli.eight_bit_output,
         bwlimit: cli.bwlimit.as_deref().and_then(parse_bwlimit),
+        partial: cli.partial,
+        partial_dir: cli.partial_dir.map(PathBuf::from),
     };
 
     let engine = SyncEngine::new(sync_opts);

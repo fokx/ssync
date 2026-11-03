@@ -329,3 +329,30 @@ pub fn safe_rename_into(
         Ok(())
     }
 }
+
+/// Checks whether an ancestor component relative to `parent` is a foreign-owned symlink.
+pub fn check_component_ownership(parent: &Path, comp: &Path) -> Result<bool, std::io::Error> {
+    let parent_fd = DirFd::open_dir(parent, false)?;
+    let c_comp = CString::new(comp.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: parent_fd is valid and c_comp is a valid C string.
+    let rc = unsafe {
+        libc::fstatat(
+            parent_fd.raw(),
+            c_comp.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        let euid = unsafe { libc::geteuid() };
+        if st.st_uid != 0 && st.st_uid != euid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}

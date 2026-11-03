@@ -842,3 +842,45 @@ fn test_backup_crossdev_copy_specials_and_symlinks() {
         assert!(meta.file_type().is_fifo());
     }
 }
+
+#[test]
+fn test_partial_dir_delta_resume_and_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    let partial_dir = dest.join(".partial");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&partial_dir).unwrap();
+
+    let full_content = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_FULL_CONTENT_FOR_PARTIAL_TEST";
+    fs::write(src.join("file.bin"), full_content).unwrap();
+
+    // Pre-seed partial file in .partial
+    fs::write(partial_dir.join("file.bin"), &full_content[..20]).unwrap();
+
+    let walker = Walker::new(WalkOptions {
+        recursive: true,
+        ..Default::default()
+    });
+    let entries = walker
+        .scan_sources(&[SourcePath::from_raw(&format!("{}/", src.to_str().unwrap()))])
+        .unwrap();
+
+    let sync_opts = SyncOptions {
+        partial: true,
+        partial_dir: Some(std::path::PathBuf::from(".partial")),
+        no_whole_file: true,
+        ..Default::default()
+    };
+    let engine = SyncEngine::new(sync_opts);
+    engine.execute(&entries, &dest).unwrap();
+
+    // 1. Destination file should be fully updated
+    assert_eq!(fs::read(dest.join("file.bin")).unwrap(), full_content);
+
+    // 2. Partial basis file should be consumed and removed
+    assert!(!partial_dir.join("file.bin").exists());
+
+    // 3. Empty partial dir should be cleaned up
+    assert!(!partial_dir.exists());
+}

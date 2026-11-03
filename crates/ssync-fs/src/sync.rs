@@ -92,6 +92,8 @@ pub struct SyncOptions {
     pub progress: bool,
     pub eight_bit_output: bool,
     pub bwlimit: Option<u64>,
+    pub partial: bool,
+    pub partial_dir: Option<PathBuf>,
 }
 
 pub struct SyncEngine {
@@ -277,6 +279,20 @@ fn format_thousands(mut n: u64) -> String {
 
 const WRITE_BUFFER_SIZE: usize = 256 * 1024;
 
+static INTERRUPTED_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn install_signal_handler() {
+    unsafe {
+        extern "C" fn handler(sig: libc::c_int) {
+            INTERRUPTED_SIGNAL.store(sig, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
 fn copy_buffered<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -293,6 +309,13 @@ fn copy_buffered<R: Read, W: Write>(
     let start_time = std::time::Instant::now();
 
     loop {
+        let sig = INTERRUPTED_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+        if sig != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "interrupted by signal",
+            ));
+        }
         let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -306,7 +329,21 @@ fn copy_buffered<R: Read, W: Write>(
                     std::time::Duration::from_secs_f64(total as f64 / limit as f64);
                 let elapsed = start_time.elapsed();
                 if expected_duration > elapsed {
-                    std::thread::sleep(expected_duration - elapsed);
+                    let mut to_sleep = expected_duration - elapsed;
+                    while to_sleep > std::time::Duration::from_millis(20) {
+                        if INTERRUPTED_SIGNAL.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "interrupted by signal",
+                            ));
+                        }
+                        let slice = to_sleep.min(std::time::Duration::from_millis(20));
+                        std::thread::sleep(slice);
+                        to_sleep = expected_duration.saturating_sub(start_time.elapsed());
+                    }
+                    if !to_sleep.is_zero() {
+                        std::thread::sleep(to_sleep);
+                    }
                 }
             }
         }
@@ -728,6 +765,7 @@ impl SyncEngine {
 
     /// Executes the synchronization of entries into `dest_root`.
     pub fn execute(&self, entries: &[TransferEntry], dest_root: &Path) -> Result<(), FsError> {
+        install_signal_handler();
         let resolved_root;
         let dest_root = if dest_root.is_dir() && dest_root.is_symlink() {
             if let Ok(canon) = dest_root.canonicalize() {
@@ -1692,6 +1730,60 @@ impl SyncEngine {
         }
 
         if needs_transfer {
+            let partial_basis = if let Some(ref pdir) = self.options.partial_dir {
+                let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+                if !pdir.is_absolute() {
+                    if let Ok(safe) = crate::secure::check_component_ownership(parent, pdir) {
+                        if !safe {
+                            eprintln!(
+                                "rsync: refusing foreign-owned symlink \"{}\"",
+                                pdir.display()
+                            );
+                            return Err(FsError::PathError("foreign-owned symlink".to_string()));
+                        }
+                    }
+                }
+                let p = if pdir.is_absolute() {
+                    pdir.join(dest_path.file_name().unwrap_or_default())
+                } else {
+                    parent
+                        .join(pdir)
+                        .join(dest_path.file_name().unwrap_or_default())
+                };
+                if p.is_file() {
+                    let open_res = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&p);
+                    if let Err(err) = open_res {
+                        if err.kind() == std::io::ErrorKind::PermissionDenied {
+                            if !pdir.is_absolute() {
+                                if let Ok(safe) =
+                                    crate::secure::check_component_ownership(parent, pdir)
+                                {
+                                    if !safe {
+                                        eprintln!(
+                                            "rsync: refusing foreign-owned symlink \"{}\"",
+                                            pdir.display()
+                                        );
+                                        return Err(FsError::PathError(
+                                            "foreign-owned symlink".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            let _ = OpenOptions::new().write(true).truncate(false).open(&p);
+                        }
+                    }
+                    Some(p)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let fuzzy_basis_path = if existing_dest_meta.is_none() && self.options.fuzzy > 0 {
                 let cand = self.find_fuzzy_candidate(entry, dest_root);
                 if let Some(ref c) = cand {
@@ -1738,17 +1830,14 @@ impl SyncEngine {
                     self.backup_file(dest_path, &entry.relative_dest_path, dest_root, false)?;
                 }
 
+                let effective_basis = fuzzy_basis_path.as_deref().or(partial_basis.as_deref());
+
                 if (self.options.append || self.options.append_verify)
                     && existing_dest_meta.is_some()
                 {
                     self.perform_append_transfer(entry, dest_path, total_stats)?;
                 } else if self.options.inplace {
-                    self.perform_inplace_transfer(
-                        entry,
-                        dest_path,
-                        fuzzy_basis_path.as_deref(),
-                        total_stats,
-                    )?;
+                    self.perform_inplace_transfer(entry, dest_path, effective_basis, total_stats)?;
                 } else if self.options.delay_updates {
                     self.perform_delay_updates_transfer(
                         entry,
@@ -1756,7 +1845,7 @@ impl SyncEngine {
                         dest_root,
                         delayed_updates,
                         delayed_staging_dirs,
-                        fuzzy_basis_path.as_deref(),
+                        effective_basis,
                         total_stats,
                     )?;
                 } else {
@@ -1764,9 +1853,20 @@ impl SyncEngine {
                         entry,
                         dest_path,
                         dest_root,
-                        fuzzy_basis_path.as_deref(),
+                        effective_basis,
                         total_stats,
                     )?;
+                }
+
+                if let Some(ref p) = partial_basis {
+                    let _ = fs::remove_file(p);
+                    if let Some(ref pdir) = self.options.partial_dir {
+                        if !pdir.is_absolute() {
+                            if let Some(pparent) = p.parent() {
+                                let _ = fs::remove_dir(pparent);
+                            }
+                        }
+                    }
                 }
 
                 if !self.options.delay_updates {
@@ -2136,11 +2236,29 @@ impl SyncEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let fname = dest_path
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default();
+        let tmp_name = format!(".{}.{:06x}", fname, rand_id & 0xffffff);
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
         let tmp_path = if let Some(ref tdir) = self.options.temp_dir {
-            tdir.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id))
+            tdir.join(&tmp_name)
         } else {
-            let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-            parent.join(format!(".ssync-tmp.{}.{}", std::process::id(), rand_id))
+            parent.join(&tmp_name)
+        };
+
+        let partial_path = if let Some(ref pdir) = self.options.partial_dir {
+            let p = if pdir.is_absolute() {
+                pdir.join(dest_path.file_name().unwrap_or_default())
+            } else {
+                parent
+                    .join(pdir)
+                    .join(dest_path.file_name().unwrap_or_default())
+            };
+            Some(p)
+        } else {
+            None
         };
 
         let basis_file = if dest_path.exists() {
@@ -2230,7 +2348,33 @@ impl SyncEngine {
                     total_stats.literal_bytes += copied;
                 }
                 Err(e) => {
-                    let _ = fs::remove_file(&tmp_path);
+                    let sig = INTERRUPTED_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+                    let should_keep =
+                        (sig != 0 || self.options.partial || self.options.partial_dir.is_some())
+                            && tmp_path.exists()
+                            && tmp_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+
+                    if should_keep {
+                        if let Some(ref p) = partial_path {
+                            if let Some(pparent) = p.parent() {
+                                let _ = fs::create_dir_all(pparent);
+                            }
+                            let _ = fs::rename(&tmp_path, p);
+                        } else if self.options.partial {
+                            let _ = fs::rename(&tmp_path, dest_path);
+                        } else {
+                            let _ = fs::remove_file(&tmp_path);
+                        }
+                    } else {
+                        let _ = fs::remove_file(&tmp_path);
+                    }
+
+                    if sig != 0 {
+                        unsafe {
+                            libc::signal(sig, libc::SIG_DFL);
+                            libc::raise(sig);
+                        }
+                    }
                     return Err(FsError::Io(e));
                 }
             }
